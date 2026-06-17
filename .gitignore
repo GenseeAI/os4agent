@@ -1,0 +1,20 @@
+# Local container/runtime config rendered from the sample template
+.os4agent-containers.conf
+
+# VM / disk images and local env files
+*.qcow2
+.env
+
+# Logs
+*.log
+
+# Python
+__pycache__/
+*.pyc
+
+# Agent benchmark run artifacts
+_fixtures/
+runs*/
+ckpt-*/
+tfork-*/
+ablation-*/

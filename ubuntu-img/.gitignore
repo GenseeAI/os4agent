@@ -1,0 +1,4 @@
+.jenkins-external
+.worktrees/
+config/
+.DS_Store

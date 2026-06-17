@@ -1,0 +1,11 @@
+FROM docker.io/library/eclipse-temurin:11-jammy
+ARG CC=gcc
+
+COPY . /criu
+WORKDIR /criu
+
+RUN contrib/apt-install maven "$CC" && contrib/dependencies/apt-packages.sh
+
+RUN make mrproper && make -j $(nproc) CC="$CC"
+
+ENTRYPOINT ["mvn", "-q", "-f", "test/javaTests/pom.xml", "test"]

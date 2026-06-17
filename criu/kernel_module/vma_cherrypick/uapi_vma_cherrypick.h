@@ -1,0 +1,29 @@
+#ifndef UAPI_VMA_CHERRYPICK_H
+#define UAPI_VMA_CHERRYPICK_H
+
+#define VMA_CHERRYPICK_FLAG_VPID       (0)
+#define VMA_CHERRYPICK_FLAG_PIDFD      (1)
+#define VMA_CHERRYPICK_FLAG_FORCE_COPY (1 << 1)
+#define VMA_CHERRYPICK_FLAG_WIPE_COPY  (1 << 2)
+#define VMA_CHERRYPICK_FLAG_FILE_FD    (1 << 3)
+#define VMA_CHERRYPICK_FLAG_COPY_ANON  (1 << 4)
+#define VMA_CHERRYPICK_FLAG_FILE_FD_COW (1 << 5)
+
+#define VMA_CHERRYPICK_FLAGS_VALID \
+	(VMA_CHERRYPICK_FLAG_PIDFD | VMA_CHERRYPICK_FLAG_FORCE_COPY | \
+	 VMA_CHERRYPICK_FLAG_WIPE_COPY | VMA_CHERRYPICK_FLAG_FILE_FD | \
+	 VMA_CHERRYPICK_FLAG_COPY_ANON | VMA_CHERRYPICK_FLAG_FILE_FD_COW)
+
+struct vma_cherrypick_args {
+    int target_id;
+    int flags;
+    __u64 src_addr;
+    __u64 dst_addr;
+    int file_fd;
+    int _pad;
+};
+
+#define VMA_CHERRYPICK_MAGIC 'V'
+#define VMA_CHERRYPICK _IOW(VMA_CHERRYPICK_MAGIC, 1, struct vma_cherrypick_args)
+
+#endif

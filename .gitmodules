@@ -1,0 +1,3 @@
+[submodule "crun/libocispec"]
+	path = crun/libocispec
+	url = https://github.com/containers/libocispec.git

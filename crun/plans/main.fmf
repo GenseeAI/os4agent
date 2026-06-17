@@ -1,0 +1,48 @@
+discover:
+    how: fmf
+execute:
+    how: tmt
+prepare:
+    - when: distro == centos-stream or distro == rhel
+      how: shell
+      script: |
+        dnf -y install https://dl.fedoraproject.org/pub/epel/epel-release-latest-$(rpm --eval '%{?rhel}').noarch.rpm
+        dnf -y config-manager --set-enabled epel
+      order: 10
+    - when: initiator == packit
+      how: shell
+      script: |
+        COPR_REPO_FILE="/etc/yum.repos.d/*podman-next*.repo"
+        if compgen -G $COPR_REPO_FILE > /dev/null; then
+            sed -i -n '/^priority=/!p;$apriority=1' $COPR_REPO_FILE
+        fi
+        dnf -y upgrade --allowerasing
+      order: 20
+
+    # TODO: Remove once https://issues.redhat.com/browse/RHEL-153064 is fixed.
+    - when: distro == centos-stream-9
+      how: install
+      package:
+        - iptables-legacy
+      order: 30
+
+    - how: install
+      package:
+        - bats
+        - crun
+        - podman-tests
+
+/shellcheck:
+    discover+:
+        filter: 'tag:shellcheck'
+    enabled: true
+    adjust:
+        enabled: false
+        when: distro == centos-stream-10 or distro == rhel-10
+    prepare+:
+        - how: install
+          package: ShellCheck
+
+/tests:
+    discover+:
+        filter: 'tag:podman | tag:sanity'

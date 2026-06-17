@@ -1,0 +1,11 @@
+#!/usr/bin/with-contenv bash
+
+
+set -euo pipefail
+
+SRC=/etc/skel-os4agent/plasma.tar.gz
+[ -f "$SRC" ] || exit 0
+
+mkdir -p /config/.config
+tar -xzf "$SRC" -C /config
+chown -R abc:abc /config/.config

@@ -1,0 +1,11 @@
+FROM docker.io/library/eclipse-temurin:11-alpine
+ARG CC=gcc
+
+COPY . /criu
+WORKDIR /criu
+
+RUN apk add --no-cache maven "$CC" && contrib/dependencies/apk-packages.sh
+
+RUN make mrproper && make -j $(nproc) CC="$CC"
+
+ENTRYPOINT ["mvn", "-q", "-f", "test/javaTests/pom.xml", "test"]

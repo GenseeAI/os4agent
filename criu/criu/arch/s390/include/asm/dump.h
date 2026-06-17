@@ -1,0 +1,17 @@
+#ifndef __CR_ASM_DUMP_H__
+#define __CR_ASM_DUMP_H__
+
+int save_task_regs(pid_t pid, void *arg, user_regs_struct_t *u, user_fpregs_struct_t *f);
+int arch_alloc_thread_info(CoreEntry *core);
+void arch_free_thread_info(CoreEntry *core);
+
+static inline int arch_dump_mm_pkey_state(pid_t pid, CoreEntry *core) { return 0; }
+static inline int arch_restore_mm_pkey_state(pid_t pid, CoreEntry *core) { return 0; }
+
+static inline void core_put_tls(CoreEntry *core, tls_t tls)
+{
+}
+
+#define get_task_futex_robust_list_compat(pid, info) -1
+
+#endif

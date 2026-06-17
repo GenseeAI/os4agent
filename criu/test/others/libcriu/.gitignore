@@ -1,0 +1,11 @@
+test_errno
+test_iters
+test_notify
+test_self
+test_sub
+test_join_ns
+test_pre_dump
+test_feature_check
+output/
+libcriu.so.*
+test_rpc_config

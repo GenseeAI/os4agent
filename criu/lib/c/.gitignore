@@ -1,0 +1,8 @@
+# Integration shim laid down by build.sh for podman/crun
+# (see CRIU_TFORK_IMPLEMENTATION.md §2.5).
+# All of these are symlinks or generated files.
+criu
+libcriu.so.*
+rpc.pb-c.h
+version.h
+pc/

@@ -1,0 +1,31 @@
+#!/bin/bash
+
+
+set -u
+
+CRIU="${CRIU_BIN:-/usr/sbin/criu.real}"
+
+CAP_DEV=/dev/criu_capbypass
+PKS_DEV=/dev/pkey_state
+
+
+if [ -c "$CAP_DEV" ] && exec {capfd}>"$CAP_DEV" 2>/dev/null; then
+	export CRIU_CAPBYPASS_FD=$capfd
+fi
+
+
+if [ -c "$PKS_DEV" ] && exec {pksfd}<>"$PKS_DEV" 2>/dev/null; then
+	export CRIU_PKEY_STATE_FD=$pksfd
+fi
+
+
+export CRIU_FORCE_EXT_UNIX_SK=1
+
+case "${1:-}" in
+swrk)
+	exec "$CRIU" "$@" -v4 --ghost-limit 64M --ext-unix-sk
+	;;
+*)
+	exec "$CRIU" "$@" --ghost-limit 64M --ext-unix-sk
+	;;
+esac

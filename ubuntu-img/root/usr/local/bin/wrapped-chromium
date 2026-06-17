@@ -1,0 +1,11 @@
+#! /bin/bash
+
+BIN=/usr/bin/chromium
+
+# Cleanup
+if ! pgrep chromium > /dev/null;then
+  rm -f $HOME/.config/chromium/Singleton*
+fi
+
+${BIN} --password-store=basic --no-sandbox --test-type "$@"
+# Run normally on privved containers or modified un non priv

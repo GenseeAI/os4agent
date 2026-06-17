@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools", "protobuf<4.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pycriu"
+description = "Python bindings for CRIU"
+authors = [
+    {name = "CRIU team", email = "criu@lists.linux.dev"},
+]
+license = {text = "LGPLv2.1"}
+dynamic = ["version"]
+requires-python = ">=3.6"
+dependencies = ["protobuf"]
+
+[tool.setuptools]
+packages = ["pycriu", "pycriu.images"]
+
+[tool.setuptools.dynamic]
+version = {attr = "pycriu.__version__"}

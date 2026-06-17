@@ -1,0 +1,42 @@
+#!/usr/bin/with-contenv bash
+
+
+set -euo pipefail
+
+VLC_DIR=/config/.config/vlc
+VLCRC=${VLC_DIR}/vlcrc
+
+if [ ! -f "${VLCRC}" ]; then
+    mkdir -p "${VLC_DIR}"
+    cat > "${VLCRC}" <<'EOF'
+[qt]
+qt-privacy-ask=0
+qt-recentplay=0
+qt-updates-notif=0
+qt-error-dialogs=0
+
+[core]
+metadata-network-access=0
+EOF
+fi
+
+
+KWINRULES=/config/.config/kwinrulesrc
+if [ ! -f "${KWINRULES}" ]; then
+    cat > "${KWINRULES}" <<'EOF'
+[General]
+count=1
+rules=os4agent-vlc
+
+[os4agent-vlc]
+Description=os4agent: pin VLC default size + position
+position=80,80
+positionrule=2
+size=640,400
+sizerule=2
+wmclass=vlc vlc
+wmclassmatch=1
+EOF
+fi
+
+chown -R abc:abc /config/.config

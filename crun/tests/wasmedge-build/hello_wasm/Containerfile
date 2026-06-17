@@ -1,0 +1,4 @@
+FROM scratch
+COPY hello.wasm /
+ENV key=value
+CMD ["/hello.wasm", "arg1", "arg2"]

@@ -1,0 +1,7 @@
+adjust:
+    duration: 10m
+    when: arch == aarch64
+
+summary: Run crun specific Podman tests
+test: bash ./system-test.sh
+tag: [ podman ]

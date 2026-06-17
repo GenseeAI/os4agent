@@ -1,0 +1,18 @@
+services:
+  webtop:
+    image: ${IMAGE:-ghcr.io/wuklab/webtop:ubuntu-kde}
+    container_name: webtop
+    security_opt:
+      - seccomp=unconfined
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=Etc/UTC
+      - CUSTOM_USER=admin
+      - PASSWORD=changeme
+    volumes:
+      - ./config:/config
+    ports:
+      - 3001:3001
+    shm_size: 2gb
+    restart: unless-stopped

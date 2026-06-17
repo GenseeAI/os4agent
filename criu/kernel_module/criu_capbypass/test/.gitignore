@@ -1,0 +1,6 @@
+test_capbypass
+test_non_clone_denied
+test_narrow_syscall_mask
+test_fd_close_revoke
+*.o
+*.d

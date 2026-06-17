@@ -1,0 +1,40 @@
+#!/usr/bin/env sh
+
+dnf install -y \
+	asciidoc \
+	binutils \
+	elfutils-libelf-devel \
+	gcc \
+	git \
+	glibc-devel \
+	gnutls-devel \
+	iproute \
+	iptables \
+	libaio-devel \
+	libasan \
+	libbpf-devel \
+	libbsd-devel \
+	libcap-devel \
+	libdrm-devel \
+	libnet-devel \
+	libnl3-devel \
+	libselinux-devel \
+	libtraceevent-devel \
+	libtracefs-devel \
+	libuuid-devel \
+	make \
+	nftables \
+	pkg-config \
+	protobuf \
+	protobuf-c \
+	protobuf-c-devel \
+	protobuf-compiler \
+	protobuf-devel \
+	python-devel \
+	python3-importlib-metadata \
+	python3-protobuf \
+	python3-pyyaml \
+	python3-setuptools \
+	python3-wheel \
+	rubygem-asciidoctor \
+	xmlto

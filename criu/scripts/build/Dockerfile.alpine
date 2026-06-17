@@ -1,0 +1,14 @@
+FROM alpine
+ARG CC=gcc
+
+COPY . /criu
+WORKDIR /criu
+
+RUN apk add --no-cache "$CC" && /criu/contrib/dependencies/apk-packages.sh
+
+RUN make mrproper && date && make -j $(nproc) CC="$CC" && date
+
+# The rpc test cases are running as user #1000, let's add the user
+RUN adduser -u 1000 -D test
+
+RUN make -C test/zdtm

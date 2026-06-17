@@ -1,0 +1,35 @@
+// SPDX-License-Identifier: MIT
+
+syntax = "proto2";
+
+message pid_ns {
+	required uint32			nspid		= 1;
+	required uint32			pgid		= 2;
+	required uint32			sid		= 3;
+}
+
+message thread_entry {
+	required uint32			uid		= 1;
+	repeated pid_ns			ns		= 2;
+}
+
+message pstree_entry {
+	required uint32			realpid		= 1;
+	required uint32			ppid		= 2;
+	required uint32			pgid		= 3;
+	required uint32			sid		= 4;
+	required uint32			nsid	= 5;
+	required uint32			localpid	= 6;
+	required uint32			uid			= 7;
+	repeated thread_entry			threads		= 8;
+}
+
+message pid_ns_max_entry {
+	required uint32			ns_id		= 1;
+	required uint32			pid_max		= 2;
+}
+
+message pstree_file_entry {
+	repeated pid_ns_max_entry	ns_max_pids	= 1;
+	repeated pstree_entry		tree		= 2;
+}

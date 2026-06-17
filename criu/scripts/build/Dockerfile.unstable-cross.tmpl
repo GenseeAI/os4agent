@@ -1,0 +1,23 @@
+# Add the cross compiler sources
+RUN echo "deb http://deb.debian.org/debian/ unstable main" >> /etc/apt/sources.list && \
+  dpkg --add-architecture ${DEBIAN_ARCH}
+
+ENV CROSS_COMPILE=${CROSS_TRIPLET}-				\
+	CROSS_ROOT=/usr/${CROSS_TRIPLET}			\
+	AS=/usr/bin/${CROSS_TRIPLET}-as				\
+	AR=/usr/bin/${CROSS_TRIPLET}-ar				\
+	CC=/usr/bin/${CROSS_TRIPLET}-gcc			\
+	CPP=/usr/bin/${CROSS_TRIPLET}-cpp			\
+	CXX=/usr/bin/${CROSS_TRIPLET}-g++			\
+	LD=/usr/bin/${CROSS_TRIPLET}-ld				\
+	FC=/usr/bin/${CROSS_TRIPLET}-gfortran
+
+ENV PATH="${PATH}:${CROSS_ROOT}/bin"				\
+	PKG_CONFIG_PATH=/usr/lib/${CROSS_TRIPLET}/pkgconfig
+
+COPY . /criu
+WORKDIR /criu
+
+RUN contrib/dependencies/apt-cross-packages.sh
+
+RUN make mrproper && date && make -j $(nproc) zdtm && date
