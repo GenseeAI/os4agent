@@ -1,12 +1,15 @@
-# OS4Agent
+# Tclone
 
-OS4Agent forks a live, running container in milliseconds: clones share
+Tclone is a workspace-versioning substrate built for computer-use agents. Tclone provides a versioned personal workspace that can be quickly forked, snapshotted, and rolledback.
+It forks a live, running container in milliseconds: clones share
 memory and file-cache pages copy-on-write, so a branch is runnable
 instantly while its durable checkpoint streams to disk in the background —
 letting computer-use agents explore many action paths in parallel.
 
 Please find more details in our [paper](https://arxiv.org/abs/2605.17320) and
 [blog post](https://mlsys.wuklab.io/posts/tclone/).
+
+<img width="1672" height="941" alt="image" src="https://mlsys.wuklab.io/images/tclone/overview.png" />
 
 ## Components
 
