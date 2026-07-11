@@ -1,4 +1,4 @@
-# Tclone
+# Tclone: Low-Latency Full-Workspace Forking for AI Agents
 
 Tclone is a workspace-versioning substrate built for computer-use agents. Tclone provides a versioned personal workspace that can be quickly forked, snapshotted, and rolledback.
 It forks a live, running container in milliseconds: clones share
