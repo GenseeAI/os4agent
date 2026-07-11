@@ -69,6 +69,20 @@ func (ic *ContainerEngine) containerCloneLive(ctx context.Context, opts entities
 
 	snapRO := filepath.Join(bundleDir, "snap-ro")
 
+	thawSource, err := tforkFreezeSourceCgroup(src, 10*time.Second)
+	if err != nil {
+		return nil, fmt.Errorf("freeze source cgroup before tfork snapshot: %w", err)
+	}
+	sourceThawed := false
+	defer func() {
+		if sourceThawed {
+			return
+		}
+		if err := thawSource(); err != nil {
+			logrus.Warnf("tfork: thaw source cgroup after clone setup: %v", err)
+		}
+	}()
+
 	if out, err := exec.Command("sync").CombinedOutput(); err != nil {
 		return nil, fmt.Errorf("sync: %s: %w", out, err)
 	}
@@ -497,6 +511,7 @@ func (ic *ContainerEngine) containerCloneLive(ctx context.Context, opts entities
 			logF.Close()
 			return nil, fmt.Errorf("start crun tfork: %w", err)
 		}
+		crunDone := make(chan error, 1)
 		var crunAborted bool
 		defer func() {
 			if !crunAborted && retErr != nil {
@@ -507,7 +522,7 @@ func (ic *ContainerEngine) containerCloneLive(ctx context.Context, opts entities
 			_ = f.Close()
 		}
 		go func() {
-			_ = crunCmd.Wait()
+			crunDone <- crunCmd.Wait()
 			logF.Close()
 		}()
 		perCopyAttachSocks := make([]*os.File, copies)
@@ -559,7 +574,16 @@ func (ic *ContainerEngine) containerCloneLive(ctx context.Context, opts entities
 		deadline := time.Now().Add(60 * time.Second)
 		readyCopies := 0
 		stateReady := !needState
+		crunExited := false
+		var crunErr error
 		for readyCopies < copies || !stateReady {
+			if !crunExited {
+				select {
+				case crunErr = <-crunDone:
+					crunExited = true
+				default:
+				}
+			}
 			readyCopies = 0
 			for i := 0; i < copies; i++ {
 				if _, err := os.Stat(pidFileFor(i)); err == nil {
@@ -574,7 +598,7 @@ func (ic *ContainerEngine) containerCloneLive(ctx context.Context, opts entities
 			if readyCopies >= copies && stateReady {
 				break
 			}
-			if crunCmd.ProcessState != nil && crunCmd.ProcessState.Exited() && readyCopies < copies {
+			if crunExited && readyCopies < copies {
 				tforkAbortCrunCmd(crunCmd, src, bundleDir, copies)
 				crunAborted = true
 				return nil, fmt.Errorf("crun tfork exited before %d clones came up (got %d); see %s",
@@ -588,8 +612,30 @@ func (ic *ContainerEngine) containerCloneLive(ctx context.Context, opts entities
 			}
 			time.Sleep(200 * time.Millisecond)
 		}
+		if !crunExited {
+			select {
+			case crunErr = <-crunDone:
+				crunExited = true
+			case <-time.After(10 * time.Second):
+				tforkAbortCrunCmd(crunCmd, src, bundleDir, copies)
+				crunAborted = true
+				return nil, fmt.Errorf("timeout waiting for crun tfork to finish after %d clones came up; see %s",
+					copies, logPath)
+			}
+		}
+		if crunErr != nil {
+			tforkAbortCrunCmd(crunCmd, src, bundleDir, copies)
+			crunAborted = true
+			return nil, fmt.Errorf("crun tfork failed after %d clones came up: %w; see %s",
+				copies, crunErr, logPath)
+		}
 		logrus.Infof("tfork: batch %s up (N=%d); crun-tfork.log at %s", batchID, copies, logPath)
 	}
+
+	if err := thawSource(); err != nil {
+		return nil, fmt.Errorf("thaw source cgroup after tfork restore: %w", err)
+	}
+	sourceThawed = true
 
 	srcCfg := src.Config()
 	if srcCfg == nil {
@@ -664,6 +710,110 @@ func (ic *ContainerEngine) containerCloneLive(ctx context.Context, opts entities
 	}
 
 	return &entities.ContainerCreateReport{Id: strings.Join(cloneIDs, "\n")}, nil
+}
+
+func tforkFreezeSourceCgroup(src *libpod.Container, timeout time.Duration) (func() error, error) {
+	if src == nil {
+		return nil, fmt.Errorf("source container is nil")
+	}
+	cgPath, err := src.CgroupPath()
+	if err != nil {
+		return nil, fmt.Errorf("read source cgroup path: %w", err)
+	}
+	cgPath = strings.TrimPrefix(filepath.Clean(cgPath), string(os.PathSeparator))
+	if cgPath == "" || cgPath == "." {
+		return nil, fmt.Errorf("source cgroup path is empty")
+	}
+	cgFS := filepath.Join("/sys/fs/cgroup", cgPath)
+	freezePath := filepath.Join(cgFS, "cgroup.freeze")
+	eventsPath := filepath.Join(cgFS, "cgroup.events")
+
+	originalFrozen, err := tforkCgroupFrozen(freezePath)
+	if err != nil {
+		return nil, fmt.Errorf("read %s: %w", freezePath, err)
+	}
+	if err := os.WriteFile(freezePath, []byte("1"), 0o644); err != nil {
+		return nil, fmt.Errorf("write %s=1: %w", freezePath, err)
+	}
+	if err := tforkWaitCgroupFrozen(eventsPath, timeout); err != nil {
+		_ = os.WriteFile(freezePath, []byte("0"), 0o644)
+		return nil, err
+	}
+	logrus.Infof("tfork: froze source cgroup for snapshot consistency: %s", cgFS)
+
+	thaw := func() error {
+		if originalFrozen {
+			if err := os.WriteFile(freezePath, []byte("1"), 0o644); err != nil {
+				return fmt.Errorf("restore %s=1: %w", freezePath, err)
+			}
+			return nil
+		}
+		if err := os.WriteFile(freezePath, []byte("0"), 0o644); err != nil {
+			return fmt.Errorf("write %s=0: %w", freezePath, err)
+		}
+		if err := tforkWaitCgroupThawed(eventsPath, 10*time.Second); err != nil {
+			return err
+		}
+		logrus.Infof("tfork: thawed source cgroup after clone restore: %s", cgFS)
+		return nil
+	}
+	return thaw, nil
+}
+
+func tforkCgroupFrozen(freezePath string) (bool, error) {
+	data, err := os.ReadFile(freezePath)
+	if err != nil {
+		return false, err
+	}
+	return strings.TrimSpace(string(data)) == "1", nil
+}
+
+func tforkWaitCgroupFrozen(eventsPath string, timeout time.Duration) error {
+	return tforkWaitCgroupFrozenState(eventsPath, true, timeout)
+}
+
+func tforkWaitCgroupThawed(eventsPath string, timeout time.Duration) error {
+	return tforkWaitCgroupFrozenState(eventsPath, false, timeout)
+}
+
+func tforkWaitCgroupFrozenState(eventsPath string, wantFrozen bool, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for {
+		data, err := os.ReadFile(eventsPath)
+		if err != nil {
+			return fmt.Errorf("read %s: %w", eventsPath, err)
+		}
+		frozen, ok := tforkCgroupEventsFrozen(data)
+		if ok && frozen == wantFrozen {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("timeout waiting for %s to report frozen %d", eventsPath, tforkBoolInt(wantFrozen))
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+func tforkCgroupEventsFrozen(data []byte) (bool, bool) {
+	for _, line := range strings.Split(string(data), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) == 2 && fields[0] == "frozen" {
+			switch fields[1] {
+			case "0":
+				return false, true
+			case "1":
+				return true, true
+			}
+		}
+	}
+	return false, false
+}
+
+func tforkBoolInt(v bool) int {
+	if v {
+		return 1
+	}
+	return 0
 }
 
 func spawnTforkDumpdHolder() (int, uint64, error) {
