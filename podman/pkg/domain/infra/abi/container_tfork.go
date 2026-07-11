@@ -858,7 +858,7 @@ func (f *tforkCgroupFreezer) waitFrozen(wantFrozen bool, timeout time.Duration) 
 			return nil
 		}
 		if time.Now().After(deadline) {
-			return fmt.Errorf("timeout waiting %s for %s to report frozen %d", timeout, path, tforkBoolInt(wantFrozen))
+			return fmt.Errorf("timeout waiting %s for %s to report frozen=%t", timeout, path, wantFrozen)
 		}
 		time.Sleep(tforkCgroupPollInterval)
 	}
@@ -875,6 +875,13 @@ func (f *tforkCgroupFreezer) parseFrozen(data []byte) (bool, bool) {
 		return false, false
 	}
 
+	switch strings.TrimSpace(string(data)) {
+	case "0":
+		return false, true
+	case "1":
+		return true, true
+	}
+
 	for _, line := range strings.Split(string(data), "\n") {
 		fields := strings.Fields(line)
 		if len(fields) == 2 && fields[0] == "frozen" {
@@ -887,13 +894,6 @@ func (f *tforkCgroupFreezer) parseFrozen(data []byte) (bool, bool) {
 		}
 	}
 	return false, false
-}
-
-func tforkBoolInt(v bool) int {
-	if v {
-		return 1
-	}
-	return 0
 }
 
 func spawnTforkDumpdHolder() (int, uint64, error) {
