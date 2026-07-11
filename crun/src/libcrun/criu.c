@@ -1353,12 +1353,13 @@ out:
 #  define CRIU_TFORK_LOG_FILE "tfork.log"
 
 static int
-read_source_state_pid (const char *path, pid_t *pid_out, libcrun_error_t *err)
+read_source_state_pid_cgroup (const char *path, pid_t *pid_out, char **cgroup_path_out, libcrun_error_t *err)
 {
   cleanup_free char *buffer = NULL;
   char err_buffer[256];
   yajl_val tree, tmp;
   const char *pid_path[] = { "pid", NULL };
+  const char *cgroup_path[] = { "cgroup-path", NULL };
   int ret;
 
   ret = read_all_file (path, &buffer, NULL, err);
@@ -1377,6 +1378,15 @@ read_source_state_pid (const char *path, pid_t *pid_out, libcrun_error_t *err)
     }
 
   *pid_out = (pid_t) strtoull (YAJL_GET_NUMBER (tmp), NULL, 10);
+
+  tmp = yajl_tree_get (tree, cgroup_path, yajl_t_string);
+  if (UNLIKELY (tmp == NULL))
+    {
+      yajl_tree_free (tree);
+      return crun_make_error (err, 0, "`cgroup-path` missing in source state.json `%s`", path);
+    }
+
+  *cgroup_path_out = xstrdup (YAJL_GET_STRING (tmp));
   yajl_tree_free (tree);
   return 0;
 }
@@ -1439,10 +1449,13 @@ libcrun_container_tfork_linux_criu (libcrun_container_t *container, libcrun_chec
 {
   runtime_spec_schema_config_schema *def = container->container_def;
   cleanup_wrapper struct libcriu_wrapper_s *wrapper = NULL;
+  cleanup_free char *freezer_path = NULL;
   cleanup_free char *rootfs_path = NULL;
+  cleanup_free char *source_cgroup_path = NULL;
   cleanup_close int image_fd = -1;
   cleanup_close int work_fd = -1;
   pid_t source_pid = 0;
+  int cgroup_mode;
   int ret;
 
   ret = load_wrapper (&wrapper, err);
@@ -1470,7 +1483,7 @@ libcrun_container_tfork_linux_criu (libcrun_container_t *container, libcrun_chec
   if (UNLIKELY (cr_options->image_path == NULL))
     return crun_make_error (err, 0, "--image-path is required");
 
-  ret = read_source_state_pid (cr_options->source_state, &source_pid, err);
+  ret = read_source_state_pid_cgroup (cr_options->source_state, &source_pid, &source_cgroup_path, err);
   if (UNLIKELY (ret < 0))
     return ret;
   if (UNLIKELY (source_pid <= 0))
@@ -1515,6 +1528,21 @@ libcrun_container_tfork_linux_criu (libcrun_container_t *container, libcrun_chec
   libcriu_wrapper->criu_set_pid (source_pid);
   libcriu_wrapper->criu_set_leave_running (true);
   libcriu_wrapper->criu_set_file_locks (true);
+
+  cgroup_mode = libcrun_get_cgroup_mode (err);
+  if (UNLIKELY (cgroup_mode < 0))
+    return cgroup_mode;
+
+  if (cgroup_mode == CGROUP_MODE_UNIFIED)
+    ret = append_paths (&freezer_path, err, CGROUP_ROOT, source_cgroup_path, NULL);
+  else
+    ret = append_paths (&freezer_path, err, CGROUP_ROOT "/freezer", source_cgroup_path, NULL);
+  if (UNLIKELY (ret < 0))
+    return ret;
+
+  ret = libcriu_wrapper->criu_set_freeze_cgroup (freezer_path);
+  if (UNLIKELY (ret < 0))
+    return crun_make_error (err, -ret, "CRIU: failed setting tfork freezer %d", ret);
 
   if (def->root != NULL && def->root->path != NULL)
     {
