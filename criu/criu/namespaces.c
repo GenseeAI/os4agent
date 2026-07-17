@@ -640,10 +640,22 @@ static unsigned int task_leaf_pid_ns_id(struct pstree_item *item, unsigned int p
 
 static unsigned int ensure_task_leaf_pid_ns_id(struct pstree_item *item)
 {
+	struct pstree_item *parent = item->parent;
 	unsigned int proc_pid_ns_id;
 
-	if (item->pid->leaf_ns_id != ALL_PID_NS_ID)
-		return item->pid->leaf_ns_id;
+	if (parent && ensure_task_leaf_pid_ns_id(parent) == 0)
+		return 0;
+
+	if (item->pid->leaf_ns_id != ALL_PID_NS_ID) {
+		if (!parent)
+			return item->pid->leaf_ns_id;
+		if (item->pid->ns_level == parent->pid->ns_level &&
+		    item->pid->leaf_ns_id == parent->pid->leaf_ns_id)
+			return item->pid->leaf_ns_id;
+		if (item->pid->ns_level > parent->pid->ns_level &&
+		    item->pid->leaf_ns_id != parent->pid->leaf_ns_id)
+			return item->pid->leaf_ns_id;
+	}
 
 	proc_pid_ns_id = get_ns_id(item->pid->real, &pid_ns_desc, NULL);
 	if (!proc_pid_ns_id)
