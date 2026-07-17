@@ -1377,6 +1377,7 @@ out:
 }
 
 #  define CRIU_TFORK_LOG_FILE "tfork.log"
+#  define CRIU_TFORK_RESTORE_LOG_FILE "tfork-restore.log"
 
 static int
 read_source_state_pid_cgroup (const char *path, pid_t *pid_out, char **cgroup_path_out, libcrun_error_t *err)
@@ -1835,6 +1836,7 @@ libcrun_container_tfork_linux_criu (libcrun_container_t *container, libcrun_chec
   if (UNLIKELY (ret != 0))
     {
       show_criu_log (cr_options->work_path, CRIU_TFORK_LOG_FILE);
+      show_criu_log (cr_options->image_path, CRIU_TFORK_RESTORE_LOG_FILE);
       return crun_make_error (err, 0, "criu_tfork failed: %d", ret);
     }
 
