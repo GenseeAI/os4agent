@@ -379,7 +379,7 @@ static int seize_cgroup_tree(char *root_path, enum freezer_state state)
  */
 static int freezer_wait_processes(void)
 {
-	int i;
+	int i, collected = 0;
 
 	processes_to_wait_pids = xmalloc(sizeof(pid_t) * processes_to_wait);
 	if (processes_to_wait_pids == NULL)
@@ -388,23 +388,37 @@ static int freezer_wait_processes(void)
 	for (i = 0; i < processes_to_wait; i++) {
 		int status;
 		pid_t pid;
+		int waited_ms = 0;
 
 		/*
 		 * Here we are going to skip tasks which are already traced.
 		 * Ptraced tasks looks like children for us, so if
 		 * a task isn't ptraced yet, waitpid() will return a error.
 		 */
-		pid = waitpid(-1, &status, 0);
-		if (pid < 0) {
-			pr_perror("Unable to wait processes");
-			xfree(processes_to_wait_pids);
-			processes_to_wait_pids = NULL;
-			return -1;
+		while (1) {
+			pid = waitpid(-1, &status, opts.tfork.active ? WNOHANG : 0);
+			if (pid > 0)
+				break;
+			if (!opts.tfork.active || (pid < 0 && errno != ECHILD && errno != EINTR)) {
+				pr_perror("Unable to wait processes");
+				xfree(processes_to_wait_pids);
+				processes_to_wait_pids = NULL;
+				return -1;
+			}
+			if (pid < 0 || waited_ms >= 500) {
+				pr_warn("tfork: collected %d/%d unexpected freezer processes; continuing\n",
+					collected, processes_to_wait);
+				processes_to_wait = collected;
+				return 0;
+			}
+			usleep(10 * 1000);
+			waited_ms += 10;
 		}
 		pr_warn("Unexpected process %d in the freezer cgroup (status 0x%x)\n", pid, status);
 
-		processes_to_wait_pids[i] = pid;
+		processes_to_wait_pids[collected++] = pid;
 	}
+	processes_to_wait = collected;
 
 	return 0;
 }
