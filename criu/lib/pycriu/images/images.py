@@ -502,7 +502,7 @@ handlers = {
                                 tcp_stream_extra_handler()),
     'STATS': entry_handler(pb.stats_entry),
     'PAGEMAP': pagemap_handler(),  # Special one
-    'PSTREE': entry_handler(pb.pstree_entry),
+    'PSTREE': entry_handler(pb.pstree_file_entry),
     'REG_FILES': entry_handler(pb.reg_file_entry),
     'NS_FILES': entry_handler(pb.ns_file_entry),
     'EVENTFD_FILE': entry_handler(pb.eventfd_file_entry),

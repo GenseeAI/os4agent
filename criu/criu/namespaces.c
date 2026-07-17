@@ -592,6 +592,67 @@ static unsigned int get_ns_id(int pid, struct ns_desc *nd, protobuf_c_boolean *s
 	return __get_ns_id(pid, nd, supported, NULL);
 }
 
+static unsigned int add_nested_pid_leaf_ns_id(struct pstree_item *item)
+{
+	struct ns_id *nsid;
+
+	nsid = xzalloc(sizeof(*nsid));
+	if (!nsid)
+		return 0;
+
+	nsid->type = NS_OTHER;
+	nsid->kid = 0;
+	nsid->ns_populated = true;
+	nsid_add(nsid, &pid_ns_desc, ns_next_id++, localpid(item));
+
+	pr_info("Add nested pid leaf ns %d for task %d(%d), level %d\n",
+		nsid->id, localpid(item), realpid(item), item->pid->ns_level);
+	return nsid->id;
+}
+
+static unsigned int ensure_task_leaf_pid_ns_id(struct pstree_item *item);
+
+static unsigned int task_leaf_pid_ns_id(struct pstree_item *item, unsigned int proc_pid_ns_id)
+{
+	struct pstree_item *parent = item->parent;
+
+	/*
+	 * os4agent stores localpid as the innermost NSpid (pid->ns[0]).
+	 * Keep pstree_entry.nsid at the same namespace level. Otherwise a
+	 * nested pid namespace init such as bwrap can become (nsid=N,
+	 * localpid=1) and collide with the container init in the same nsid.
+	 */
+	if (parent && ensure_task_leaf_pid_ns_id(parent) == 0)
+		return 0;
+
+	if (parent && parent->pid->leaf_ns_id != ALL_PID_NS_ID) {
+		if (item->pid->ns_level == parent->pid->ns_level)
+			return parent->pid->leaf_ns_id;
+		if (item->pid->ns_level > parent->pid->ns_level &&
+		    proc_pid_ns_id != parent->pid->leaf_ns_id)
+			return proc_pid_ns_id;
+		if (item->pid->ns_level > parent->pid->ns_level)
+			return add_nested_pid_leaf_ns_id(item);
+	}
+
+	return proc_pid_ns_id;
+}
+
+static unsigned int ensure_task_leaf_pid_ns_id(struct pstree_item *item)
+{
+	unsigned int proc_pid_ns_id;
+
+	if (item->pid->leaf_ns_id != ALL_PID_NS_ID)
+		return item->pid->leaf_ns_id;
+
+	proc_pid_ns_id = get_ns_id(item->pid->real, &pid_ns_desc, NULL);
+	if (!proc_pid_ns_id)
+		return 0;
+
+	item->pid->leaf_ns_id = task_leaf_pid_ns_id(item, proc_pid_ns_id);
+	return item->pid->leaf_ns_id;
+}
+
 int dump_one_ns_file(int lfd, u32 id, const struct fd_parms *p)
 {
 	struct cr_img *img;
@@ -773,7 +834,7 @@ int dump_task_ns_ids(struct pstree_item *item)
 	TaskKobjIdsEntry *ids = item->ids;
 
 	ids->has_pid_ns_id = true;
-	ids->pid_ns_id = get_ns_id(pid, &pid_ns_desc, NULL);
+	ids->pid_ns_id = ensure_task_leaf_pid_ns_id(item);
 	if (!ids->pid_ns_id) {
 		pr_err("Can't make pidns id\n");
 		return -1;
