@@ -917,8 +917,13 @@ static int read_one_pstree_item(PstreeEntry *e)
 	if (read_pstree_ids(pi) < 0)
 		goto err;
 
-	if (pi->ids && pi->ids->has_pid_ns_id)
-		pi->pid->leaf_ns_id = pi->ids->pid_ns_id;
+	if (pi->ids && pi->ids->has_pid_ns_id) {
+		if (pi->ids->pid_ns_id != pi->pid->leaf_ns_id) {
+			pr_warn("PID namespace id mismatch for uid %d: pstree=%d ids=%d, keeping pstree\n",
+				uid(pi), pi->pid->leaf_ns_id, pi->ids->pid_ns_id);
+			pi->ids->pid_ns_id = pi->pid->leaf_ns_id;
+		}
+	}
 
 	if (__pstree_insert_pid(pi->pid, NULL, NULL) < 0)
 		goto err;

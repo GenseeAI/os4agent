@@ -974,6 +974,40 @@ int dump_task_ns_ids(struct pstree_item *item)
 	return 0;
 }
 
+int finalize_nested_pid_ns_ids(void)
+{
+	struct pstree_item *item;
+
+	for_each_pstree_item(item) {
+		struct pstree_item *parent = item->parent;
+		unsigned int nsid;
+		int i;
+
+		if (!parent)
+			continue;
+		if (item->pid->ns_level <= parent->pid->ns_level)
+			continue;
+		if (item->pid->leaf_ns_id != parent->pid->leaf_ns_id)
+			continue;
+
+		nsid = add_nested_pid_leaf_ns_id(item);
+		if (!nsid)
+			return -1;
+
+		item->pid->leaf_ns_id = nsid;
+		for (i = 0; i < item->nr_threads; i++)
+			item->threads[i].leaf_ns_id = nsid;
+		if (item->ids && item->ids->has_pid_ns_id)
+			item->ids->pid_ns_id = nsid;
+
+		pr_info("finalize nested pid ns task=%d(%d) uid=%d level=%d parent_nsid=%d selected=%u\n",
+			localpid(item), realpid(item), uid(item), item->pid->ns_level,
+			parent->pid->leaf_ns_id, nsid);
+	}
+
+	return 0;
+}
+
 static UsernsEntry userns_entry = USERNS_ENTRY__INIT;
 #define INVALID_ID (~0U)
 

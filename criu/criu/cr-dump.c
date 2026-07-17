@@ -2360,6 +2360,9 @@ int cr_dump_tasks(pid_t pid)
 	if (dump_zombies())
 		goto err;
 
+	if (finalize_nested_pid_ns_ids())
+		goto err;
+
 	if (dump_pstree(root_item))
 		goto err;
 
