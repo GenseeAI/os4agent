@@ -436,7 +436,10 @@ int dump_pstree(struct pstree_item *root_item)
 		pstree_entry__init(e);
 		tree_entries[nr_items++] = e;
 
-		pr_info("Process: %d(%d)\n", localpid(item), realpid(item));
+		pr_info("Process: %d(%d) uid=%d nsid=%d level=%d parent=%d parent_nsid=%d\n",
+			localpid(item), realpid(item), uid(item), item->pid->leaf_ns_id,
+			item->pid->ns_level, item->parent ? realpid(item->parent) : 0,
+			item->parent ? item->parent->pid->leaf_ns_id : -1);
 
 		e->realpid = realpid(item);
 		e->ppid = item->parent ? realpid(item->parent) : 0;

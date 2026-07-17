@@ -615,6 +615,7 @@ static unsigned int ensure_task_leaf_pid_ns_id(struct pstree_item *item);
 static unsigned int task_leaf_pid_ns_id(struct pstree_item *item, unsigned int proc_pid_ns_id)
 {
 	struct pstree_item *parent = item->parent;
+	unsigned int selected;
 
 	/*
 	 * os4agent stores localpid as the innermost NSpid (pid->ns[0]).
@@ -626,16 +627,29 @@ static unsigned int task_leaf_pid_ns_id(struct pstree_item *item, unsigned int p
 		return 0;
 
 	if (parent && parent->pid->leaf_ns_id != ALL_PID_NS_ID) {
-		if (item->pid->ns_level == parent->pid->ns_level)
-			return parent->pid->leaf_ns_id;
+		if (item->pid->ns_level == parent->pid->ns_level) {
+			selected = parent->pid->leaf_ns_id;
+			goto out;
+		}
 		if (item->pid->ns_level > parent->pid->ns_level &&
-		    proc_pid_ns_id != parent->pid->leaf_ns_id)
-			return proc_pid_ns_id;
-		if (item->pid->ns_level > parent->pid->ns_level)
-			return add_nested_pid_leaf_ns_id(item);
+		    proc_pid_ns_id != parent->pid->leaf_ns_id) {
+			selected = proc_pid_ns_id;
+			goto out;
+		}
+		if (item->pid->ns_level > parent->pid->ns_level) {
+			selected = add_nested_pid_leaf_ns_id(item);
+			goto out;
+		}
 	}
 
-	return proc_pid_ns_id;
+	selected = proc_pid_ns_id;
+
+out:
+	pr_info("pid leaf ns task=%d(%d) uid=%d level=%d parent_level=%d proc_nsid=%u parent_nsid=%d selected=%u\n",
+		localpid(item), realpid(item), uid(item), item->pid->ns_level,
+		parent ? parent->pid->ns_level : -1, proc_pid_ns_id,
+		parent ? parent->pid->leaf_ns_id : -1, selected);
+	return selected;
 }
 
 static unsigned int ensure_task_leaf_pid_ns_id(struct pstree_item *item)
@@ -844,14 +858,36 @@ int dump_task_ns_ids(struct pstree_item *item)
 	int i;
 	int pid = item->pid->real;
 	TaskKobjIdsEntry *ids = item->ids;
+	struct pstree_item *parent = item->parent;
+	unsigned int proc_pid_ns_id;
 
 	ids->has_pid_ns_id = true;
-	ids->pid_ns_id = ensure_task_leaf_pid_ns_id(item);
+	proc_pid_ns_id = get_ns_id(pid, &pid_ns_desc, NULL);
+	if (!proc_pid_ns_id) {
+		pr_err("Can't make pidns id\n");
+		return -1;
+	}
+
+	if (parent && ensure_task_leaf_pid_ns_id(parent) == 0)
+		return -1;
+
+	ids->pid_ns_id = proc_pid_ns_id;
+	if (parent && item->pid->ns_level == parent->pid->ns_level)
+		ids->pid_ns_id = parent->pid->leaf_ns_id;
+	else if (parent && item->pid->ns_level > parent->pid->ns_level &&
+		 ids->pid_ns_id == parent->pid->leaf_ns_id)
+		ids->pid_ns_id = add_nested_pid_leaf_ns_id(item);
+
 	if (!ids->pid_ns_id) {
 		pr_err("Can't make pidns id\n");
 		return -1;
 	}
 	item->pid->leaf_ns_id = ids->pid_ns_id;
+
+	pr_info("dump pid ns task=%d(%d) uid=%d level=%d parent_level=%d proc_nsid=%u parent_nsid=%d selected=%u\n",
+		localpid(item), realpid(item), uid(item), item->pid->ns_level,
+		parent ? parent->pid->ns_level : -1, proc_pid_ns_id,
+		parent ? parent->pid->leaf_ns_id : -1, ids->pid_ns_id);
 
 	for (i = 0; i < item->nr_threads; i++)
 		item->threads[i].leaf_ns_id = ids->pid_ns_id;

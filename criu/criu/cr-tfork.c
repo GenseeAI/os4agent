@@ -966,8 +966,9 @@ int cr_tfork_tasks(pid_t pid)
 		opts.tfork.pidfd_map[opts.tfork.pidfd_map_nr].pidfd = pidfd;
 		opts.tfork.pidfd_map[opts.tfork.pidfd_map_nr].memfd = -1;
 		opts.tfork.pidfd_map_nr++;
-		pr_info("tfork: pidfd %d for pid %d (vpid %d uid %d)\n",
-			pidfd, item->pid->real, localpid(item), uid(item));
+		pr_info("tfork: pidfd %d for pid %d (vpid %d uid %d nsid %d level %d)\n",
+			pidfd, item->pid->real, localpid(item), uid(item),
+			item->pid->leaf_ns_id, item->pid->ns_level);
 	}
 
 	ret = run_scripts(ACT_PRE_TFORK_RESTORE);
