@@ -54,6 +54,15 @@ func (ic *ContainerEngine) containerCloneLive(ctx context.Context, opts entities
 	if copies <= 0 {
 		copies = 1
 	}
+	requestedCopies := copies
+	useSingleCopyConmon := requestedCopies == 1 && os.Getenv("PODMAN_TFORK_SINGLE_COPY_CONMON") == "1"
+	if requestedCopies == 1 && !useSingleCopyConmon {
+		// The CRIU/crun single-copy tfork path can abort before producing a
+		// clone PID (`free(): invalid pointer`). Run a two-copy batch internally
+		// to use the known-good batch path, then remove the hidden spare clone
+		// before returning to the caller.
+		copies = 2
+	}
 
 	var srcRootfs string
 	if cfg := src.Config(); cfg != nil && cfg.ExternalSetup && cfg.Rootfs != "" {
@@ -219,7 +228,11 @@ func (ic *ContainerEngine) containerCloneLive(ctx context.Context, opts entities
 			baseName = src.Name() + "-clone"
 		}
 		cloneName := baseName
-		if copies > 1 {
+		if requestedCopies == 1 && copies > 1 {
+			if i > 0 {
+				cloneName = fmt.Sprintf("%s-tfork-spare-%d", baseName, i)
+			}
+		} else if copies > 1 {
 			cloneName = fmt.Sprintf("%s-%d", baseName, i)
 		}
 		cloneNames[i] = cloneName
@@ -423,7 +436,9 @@ func (ic *ContainerEngine) containerCloneLive(ctx context.Context, opts entities
 		}
 	}()
 	hasTTY := len(ttySrcFds) > 0
-	useConmon := copies == 1
+	// Keep the legacy single-copy conmon bootstrap opt-in because it can fail
+	// before crun starts and report only `conmon reported pid=-1`.
+	useConmon := copies == 1 && useSingleCopyConmon
 
 	if useConmon {
 		conmonInheritFds := inheritFds
@@ -651,6 +666,7 @@ func (ic *ContainerEngine) containerCloneLive(ctx context.Context, opts entities
 	if srcCfg == nil {
 		return nil, fmt.Errorf("source %q: could not read libpod config", src.ID())
 	}
+	visibleCloneIDs := make([]string, 0, requestedCopies)
 	for i, cloneID := range cloneIDs {
 		clonePID, err := readTforkClonePID(cloneID, imgDir, i, copies)
 		if err != nil {
@@ -717,9 +733,27 @@ func (ic *ContainerEngine) containerCloneLive(ctx context.Context, opts entities
 			}
 		}
 		logrus.Infof("tfork: clone %s (%s) registered in libpod state, pid=%d", cloneID, cloneNames[i], clonePID)
+		if i >= requestedCopies {
+			if err := removeHiddenTforkClone(ctx, ic, ctr); err != nil {
+				logrus.Warnf("tfork: hidden spare clone %s cleanup failed: %v", cloneID, err)
+			} else {
+				logrus.Infof("tfork: hidden spare clone %s removed", cloneID)
+			}
+			continue
+		}
+		visibleCloneIDs = append(visibleCloneIDs, cloneID)
 	}
 
-	return &entities.ContainerCreateReport{Id: strings.Join(cloneIDs, "\n")}, nil
+	return &entities.ContainerCreateReport{Id: strings.Join(visibleCloneIDs, "\n")}, nil
+}
+
+func removeHiddenTforkClone(ctx context.Context, ic *ContainerEngine, ctr *libpod.Container) error {
+	oldNoReap, hadNoReap := os.LookupEnv("PODMAN_TFORK_NO_REAP")
+	if hadNoReap {
+		_ = os.Unsetenv("PODMAN_TFORK_NO_REAP")
+		defer os.Setenv("PODMAN_TFORK_NO_REAP", oldNoReap)
+	}
+	return ic.Libpod.RemoveContainer(ctx, ctr, true, true, nil)
 }
 
 type tforkCgroupFreezer struct {
