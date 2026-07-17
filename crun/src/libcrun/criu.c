@@ -545,6 +545,9 @@ show_criu_log (const char *work_path, const char *log)
   cleanup_free char *log_path = NULL;
   libcrun_error_t *tmp_err = NULL;
   char line[1024];
+  char tail[200][1024];
+  size_t tail_index = 0;
+  size_t tail_count = 0;
   FILE *f;
 
   if (UNLIKELY (append_paths (&log_path, tmp_err, work_path, log, NULL)) < 0)
@@ -564,11 +567,34 @@ show_criu_log (const char *work_path, const char *log)
   /* Log with error verbosity as this is the default. */
   libcrun_error (0, "--- excerpt from CRIU log `%s`", log_path);
   while (fgets (line, sizeof (line), f) != NULL)
-    if (strstr (line, "Error ") != NULL)
-      {
-        line[strcspn (line, "\n")] = '\0';
-        libcrun_error (0, "%s", line);
-      }
+    {
+      strncpy (tail[tail_index], line, sizeof (tail[tail_index]) - 1);
+      tail[tail_index][sizeof (tail[tail_index]) - 1] = '\0';
+      tail_index = (tail_index + 1) % 200;
+      if (tail_count < 200)
+        tail_count++;
+
+      if (strstr (line, "Error ") != NULL || strstr (line, "Warn ") != NULL
+          || strstr (line, "failed") != NULL || strstr (line, "FAILED") != NULL
+          || strstr (line, "Unable") != NULL || strstr (line, "Can't") != NULL
+          || strstr (line, "No such") != NULL)
+        {
+          line[strcspn (line, "\n")] = '\0';
+          libcrun_error (0, "%s", line);
+        }
+    }
+
+  if (tail_count > 0)
+    {
+      size_t start = (tail_count == 200) ? tail_index : 0;
+      libcrun_error (0, "--- last %zu CRIU log lines", tail_count);
+      for (size_t i = 0; i < tail_count; i++)
+        {
+          char *entry = tail[(start + i) % 200];
+          entry[strcspn (entry, "\n")] = '\0';
+          libcrun_error (0, "%s", entry);
+        }
+    }
 
   fclose (f);
   libcrun_error (0, "--- end of excerpt");
