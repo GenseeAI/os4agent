@@ -745,9 +745,8 @@ static struct pstree_item *get_or_create_pstree_item(pid_t real, pid_t local, in
 {
     struct pid *found;
     struct pstree_item *item;
-    struct rb_node **root_link, *root_parent;
 
-    found = __lookup_pid_root(&pid_root_rb[ALL_PID_NS_ID], real, &root_parent, &root_link);
+    found = __lookup_pid_root(&pid_root_rb[ALL_PID_NS_ID], real, NULL, NULL);
     if (found) {
         if (pidns_id != ALL_PID_NS_ID) {
             BUG_ON(found->leaf_ns_id != pidns_id || found->local != local);
@@ -762,11 +761,6 @@ static struct pstree_item *get_or_create_pstree_item(pid_t real, pid_t local, in
     item->pid->real = real;
     item->pid->local = local;
     item->pid->leaf_ns_id = pidns_id;
-
-    if (__pstree_insert_pid(item->pid, root_parent, root_link) < 0) {
-        xfree(item);
-        return NULL;
-    }
 
     return item;
 }
@@ -916,6 +910,16 @@ static int read_one_pstree_item(PstreeEntry *e)
 	pi->pid->state = TASK_ALIVE;
 	pi->pid->uid = e->uid;
 
+	/* note: we don't fail if we have empty ids */
+	if (read_pstree_ids(pi) < 0)
+		goto err;
+
+	if (pi->ids && pi->ids->has_pid_ns_id)
+		pi->pid->leaf_ns_id = pi->ids->pid_ns_id;
+
+	if (__pstree_insert_pid(pi->pid, NULL, NULL) < 0)
+		goto err;
+
 	if (e->ppid == 0) {
 		if (root_item) {
 			pr_err("Parent missed on non-root task "
@@ -976,10 +980,6 @@ static int read_one_pstree_item(PstreeEntry *e)
 
 	task_entries->nr_threads += e->n_threads;
 	task_entries->nr_tasks++;
-
-	/* note: we don't fail if we have empty ids */
-	if (read_pstree_ids(pi) < 0)
-		goto err;
 
 	ret = 1;
 err:
