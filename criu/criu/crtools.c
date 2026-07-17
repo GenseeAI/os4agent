@@ -339,8 +339,13 @@ int main(int argc, char *argv[], char *envp[])
 			int failed = 0;
 			const char *base_log = opts.output;
 
-			const int ns_flags =
-				CLONE_NEWPID | CLONE_NEWNS;
+			/*
+			 * The n-copy helper must not create/occupy PID 1 in a new
+			 * PID namespace. CRIU restores the real root task as PID 1
+			 * from the image; if the helper has already consumed it,
+			 * restore fails with EEXIST ("Can't fork for 1").
+			 */
+			const int ns_flags = CLONE_NEWNS;
 
 			if (!opts.tfork.active) {
 				pr_err("--tfork-copies>1 requires --tfork-restore "
