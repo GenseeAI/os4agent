@@ -1378,6 +1378,18 @@ out:
 
 #  define CRIU_TFORK_LOG_FILE "tfork.log"
 #  define CRIU_TFORK_RESTORE_LOG_FILE "tfork-restore.log"
+#  define CRIU_TFORK_MAX_COPY_LOGS 16
+
+static void
+show_criu_tfork_restore_copy_logs (const char *image_path)
+{
+  for (int i = 0; i < CRIU_TFORK_MAX_COPY_LOGS; i++)
+    {
+      char log[64];
+      snprintf (log, sizeof (log), "%s.copy%d", CRIU_TFORK_RESTORE_LOG_FILE, i);
+      show_criu_log (image_path, log);
+    }
+}
 
 static int
 read_source_state_pid_cgroup (const char *path, pid_t *pid_out, char **cgroup_path_out, libcrun_error_t *err)
@@ -1837,6 +1849,7 @@ libcrun_container_tfork_linux_criu (libcrun_container_t *container, libcrun_chec
     {
       show_criu_log (cr_options->work_path, CRIU_TFORK_LOG_FILE);
       show_criu_log (cr_options->image_path, CRIU_TFORK_RESTORE_LOG_FILE);
+      show_criu_tfork_restore_copy_logs (cr_options->image_path);
       return crun_make_error (err, 0, "criu_tfork failed: %d", ret);
     }
 

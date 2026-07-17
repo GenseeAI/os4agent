@@ -339,8 +339,7 @@ int main(int argc, char *argv[], char *envp[])
 			int failed = 0;
 			const char *base_log = opts.output;
 
-			const int ns_flags =
-				CLONE_NEWPID | CLONE_NEWNS;
+			const int ns_flags = CLONE_NEWNS;
 
 			if (!opts.tfork.active) {
 				pr_err("--tfork-copies>1 requires --tfork-restore "
