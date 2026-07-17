@@ -450,6 +450,8 @@ int main(int argc, char *argv[], char *envp[])
 					if (opts.tfork.snap_roots_n > 0)
 						opts.root = opts.tfork.snap_roots[i];
 
+					opts.keep_pid_hierarchy = 0;
+
 					if (tfork_load_ncopy_fabric(i)) {
 						pr_err("tfork-ncopy: copy %d fabric load failed\n",
 						       i);

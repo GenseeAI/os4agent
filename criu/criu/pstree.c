@@ -1280,6 +1280,8 @@ static int new_pid_ns_truncate_pid_hierarchy(pid_t *pid_max)
 	}
 
 	ns_level_to_truncate = root_item->pid->ns_level - 1;
+	pr_info("pidns: truncating %u outer pid namespace level(s) for new root pid namespace\n",
+		ns_level_to_truncate);
 
 	for (node = rb_first(&pid_root_rb[ALL_PID_NS_ID]); node; ) {
 		next = rb_next(node);
@@ -1287,9 +1289,15 @@ static int new_pid_ns_truncate_pid_hierarchy(pid_t *pid_max)
 		pid_node = rb_entry(node, struct pid, root_ns_node);
 		rb_erase(node, &pid_root_rb[ALL_PID_NS_ID]);
 
+		pr_info("pidns: truncate before uid=%d real=%d local=%d level=%d\n",
+			pid_node->uid, pid_node->real, pid_node->local,
+			pid_node->ns_level);
 		pid_node->ns_level -= ns_level_to_truncate;
 		BUG_ON(pid_node->ns_level <= 0);
 		pid_node->real = pid_node->ns[pid_node->ns_level - 1].ns_pid;
+		pr_info("pidns: truncate after uid=%d real=%d local=%d level=%d\n",
+			pid_node->uid, pid_node->real, pid_node->local,
+			pid_node->ns_level);
 
 		found = __lookup_pid_root(&new_real_rbtree, pid_node->real, &parent, &link);
 		if (found) {

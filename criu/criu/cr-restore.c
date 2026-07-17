@@ -1434,7 +1434,14 @@ static inline int fork_with_pid(struct pstree_item *item)
 		strip |= CLONE_NEWUSER;
 
 	if (kdat.has_clone3_set_tid) {
-		if (item->pid->ns_level == 1)
+		if (opts.tfork.active && item == root_item &&
+		    (ca.clone_flags & CLONE_NEWPID) &&
+		    item->pid->ns_level > 1) {
+			pr_info("tfork: restore root with local pid %d, dropping dumped outer pid chain level=%d\n",
+				pid, item->pid->ns_level);
+			ret = clone3_with_pid_noasan(restore_task_with_children, &ca,
+						     ca.clone_flags & ~strip, SIGCHLD, pid);
+		} else if (item->pid->ns_level == 1)
 			ret = clone3_with_pid_noasan(restore_task_with_children, &ca,
 						     ca.clone_flags & ~strip, SIGCHLD, pid);
 		else
