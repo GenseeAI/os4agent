@@ -189,6 +189,9 @@ static int __restore_wait_inprogress_tasks(int participants)
 	futex_wait_while_gt(np, participants);
 	ret = (int)futex_get(np);
 	if (ret < 0) {
+		pr_err("restore wait aborted: participants=%d nr_in_progress=%d start_stage=%d cr_err=%d task_cr_err=%d\n",
+		       participants, ret, (int)futex_get(&task_entries->start),
+		       (int)futex_get(&task_entries->cr_err), get_task_cr_err());
 		set_cr_errno(get_task_cr_err());
 		return ret;
 	}
@@ -227,6 +230,9 @@ static inline void __restore_switch_stage(int next_stage)
 
 static int restore_switch_stage(int next_stage)
 {
+	pr_info("restore_switch_stage %d participants=%d nr_tasks=%d nr_threads=%d nr_helpers=%d\n",
+		next_stage, stage_participants(next_stage), task_entries->nr_tasks,
+		task_entries->nr_threads, task_entries->nr_helpers);
 	__restore_switch_stage(next_stage);
 	return restore_wait_inprogress_tasks();
 }

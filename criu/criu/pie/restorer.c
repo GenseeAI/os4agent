@@ -162,7 +162,8 @@ static void sigchld_handler(int signal, siginfo_t *siginfo, void *data)
 	else
 		r = "disappeared with";
 
-	pr_info("Task %d %s %d\n", siginfo->si_pid, r, siginfo->si_status);
+	pr_err("SIGCHLD during restore: task %d %s %d\n",
+	       siginfo->si_pid, r, siginfo->si_status);
 
 	futex_abort_and_wake(&task_entries_local->nr_in_progress);
 	/* sa_restorer may be unmaped, so we can't go back to userspace*/
