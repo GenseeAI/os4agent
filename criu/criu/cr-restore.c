@@ -1434,11 +1434,9 @@ static inline int fork_with_pid(struct pstree_item *item)
 		strip |= CLONE_NEWUSER;
 
 	if (kdat.has_clone3_set_tid) {
-		if (opts.tfork.active && item == root_item &&
-		    (ca.clone_flags & CLONE_NEWPID) &&
-		    item->pid->ns_level > 1) {
-			pr_info("tfork: restore root with local pid %d, dropping dumped outer pid chain level=%d\n",
-				pid, item->pid->ns_level);
+		if (opts.tfork.active && (ca.clone_flags & CLONE_NEWPID)) {
+			pr_info("tfork: restore pidns init uid=%d local pid %d with fresh parent pid, dumped chain level=%d\n",
+				uid(item), pid, item->pid->ns_level);
 			ret = clone3_with_pid_noasan(restore_task_with_children, &ca,
 						     ca.clone_flags & ~strip, SIGCHLD, pid);
 		} else if (item->pid->ns_level == 1)
@@ -1469,13 +1467,26 @@ static inline int fork_with_pid(struct pstree_item *item)
 				   (ca.clone_flags & ~strip) | SIGCHLD, &ca);
 	}
 	if (ret < 0) {
+		pr_err("fork_with_pid failed item uid=%d local=%d real=%d parent_local=%d flags=0x%lx stripped_flags=0x%lx ns_level=%d root_ns_mask=0x%lx tfork=%d\n",
+		       uid(item), pid, realpid(item),
+		       item->parent ? localpid(item->parent) : -1,
+		       ca.clone_flags, ca.clone_flags & ~strip,
+		       item->pid->ns_level, root_ns_mask,
+		       opts.tfork.active ? 1 : 0);
+		if (item->pid->ns_level > 0)
+			pr_err("fork_with_pid pid chain uid=%d ns=%d/%d/%d/%d\n",
+			       uid(item),
+			       item->pid->ns[0].ns_pid,
+			       item->pid->ns_level > 1 ? item->pid->ns[1].ns_pid : -1,
+			       item->pid->ns_level > 2 ? item->pid->ns[2].ns_pid : -1,
+			       item->pid->ns_level > 3 ? item->pid->ns[3].ns_pid : -1);
 		pr_perror("Can't fork for %d", pid);
 		if (errno == EEXIST)
 			set_cr_errno(EEXIST);
 		goto err_unlock;
 	}
 
-	if (item == root_item) {
+	if (opts.tfork.active || item == root_item) {
 		item->pid->real = ret;
 		pr_debug("PID: real %d virt %d\n", item->pid->real, localpid(item));
 	}

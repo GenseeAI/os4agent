@@ -78,7 +78,10 @@ int clone3_with_pid_noasan(int (*fn)(void *), void *arg, int flags, int exit_sig
 	c_args.flags = flags;
 	c_args.set_tid = ptr_to_u64(&pid);
 	c_args.set_tid_size = 1;
+	pr_info("clone3 set_tid pid=%d flags=0x%x size=1\n", pid, flags);
 	pid = syscall(__NR_clone3, &c_args, sizeof(c_args));
+	if (pid < 0)
+		pr_perror("clone3 set_tid failed flags=0x%x size=1", flags);
 	if (pid == 0)
 		exit(fn(arg));
 	return pid;
@@ -99,6 +102,12 @@ int clone3_with_nested_pid_noasan(int (*fn)(void *), void *arg, int flags, int e
 	BUG_ON(pid->ns_level > MAX_PID_NS_LEVEL || pid->ns_level <= 1);
 	for (i = 0; i < pid->ns_level; i++)
 		tids[i] = pid->ns[i].ns_pid;
+	pr_info("clone3 nested set_tid flags=0x%x size=%d tids=%d/%d/%d/%d\n",
+		flags, pid->ns_level,
+		tids[0],
+		pid->ns_level > 1 ? tids[1] : -1,
+		pid->ns_level > 2 ? tids[2] : -1,
+		pid->ns_level > 3 ? tids[3] : -1);
 
 	if (!(flags & CLONE_PARENT)) {
 		if (exit_signal != SIGCHLD) {
@@ -112,6 +121,13 @@ int clone3_with_nested_pid_noasan(int (*fn)(void *), void *arg, int flags, int e
 	c_args.set_tid = ptr_to_u64(tids);
 	c_args.set_tid_size = pid->ns_level;
 	pid_ret = syscall(__NR_clone3, &c_args, sizeof(c_args));
+	if (pid_ret < 0)
+		pr_perror("clone3 nested set_tid failed flags=0x%x size=%d tids=%d/%d/%d/%d",
+			  flags, pid->ns_level,
+			  tids[0],
+			  pid->ns_level > 1 ? tids[1] : -1,
+			  pid->ns_level > 2 ? tids[2] : -1,
+			  pid->ns_level > 3 ? tids[3] : -1);
 	if (pid_ret == 0)
 		exit(fn(arg));
 	return pid_ret;
