@@ -68,14 +68,8 @@ func (ic *ContainerEngine) containerCloneLive(ctx context.Context, opts entities
 	}
 	requestedCopies := copies
 	useSingleCopyConmon := requestedCopies == 1 && os.Getenv("PODMAN_TFORK_SINGLE_COPY_CONMON") == "1"
-	useHiddenSpareCopy := requestedCopies == 1 && os.Getenv("PODMAN_TFORK_HIDDEN_SPARE_COPY") == "1"
-	if useHiddenSpareCopy && !useSingleCopyConmon {
-		// Older tfork experiments used a two-copy batch internally to avoid
-		// single-copy restore bugs, then removed the hidden spare. Keep that
-		// path available for diagnostics, but make the requested single-copy
-		// direct-crun path the default.
-		copies = 2
-	}
+	useSingleCopyDirect := requestedCopies == 1 && os.Getenv("PODMAN_TFORK_SINGLE_COPY_DIRECT") == "1"
+	useNcopyRestore := copies > 1 || (requestedCopies == 1 && !useSingleCopyConmon && !useSingleCopyDirect)
 
 	var srcRootfs string
 	if cfg := src.Config(); cfg != nil && cfg.ExternalSetup && cfg.Rootfs != "" {
@@ -241,11 +235,7 @@ func (ic *ContainerEngine) containerCloneLive(ctx context.Context, opts entities
 			baseName = src.Name() + "-clone"
 		}
 		cloneName := baseName
-		if requestedCopies == 1 && copies > 1 {
-			if i > 0 {
-				cloneName = fmt.Sprintf("%s-tfork-spare-%d", baseName, i)
-			}
-		} else if copies > 1 {
+		if copies > 1 {
 			cloneName = fmt.Sprintf("%s-%d", baseName, i)
 		}
 		cloneNames[i] = cloneName
@@ -329,7 +319,7 @@ func (ic *ContainerEngine) containerCloneLive(ctx context.Context, opts entities
 		"--source-state", srcStatePath,
 		"--image-path", imgDir,
 	}
-	if copies == 1 {
+	if !useNcopyRestore {
 		crunArgs = append(crunArgs, "--tfork-snap-root", cloneRootfsList[0])
 		crunArgs = append(crunArgs, "--tfork-snap-mount", "/")
 		if cloneCgroupPaths[0] != "" {
@@ -494,8 +484,8 @@ func (ic *ContainerEngine) containerCloneLive(ctx context.Context, opts entities
 		var perCopyExtraFiles []*os.File
 		var perCopyReadEnds []*os.File
 		var perCopyArgs []string
-		skipTtySrcFds := copies > 1 && hasTTY
-		if copies > 1 {
+		skipTtySrcFds := useNcopyRestore && hasTTY
+		if useNcopyRestore {
 			ifdsForPerCopy, stdioKeys := splitStdioInheritFds(inheritFds)
 			inheritFds = ifdsForPerCopy
 			extraFDBase := 3
@@ -601,13 +591,13 @@ func (ic *ContainerEngine) containerCloneLive(ctx context.Context, opts entities
 		}
 
 		pidFileFor := func(i int) string {
-			if copies == 1 {
+			if !useNcopyRestore {
 				return filepath.Join(imgDir, "tfork.pid")
 			}
 			return filepath.Join(imgDir, fmt.Sprintf("tfork.pid.copy%d", i))
 		}
 		statePath := fmt.Sprintf("/run/crun/%s/status", cloneIDs[0])
-		needState := copies == 1
+		needState := !useNcopyRestore && copies == 1
 		cloneReadyTimeout := tforkCloneReadyTimeoutFromEnv()
 		deadline := time.Now().Add(cloneReadyTimeout)
 		readyCopies := 0
@@ -682,7 +672,7 @@ func (ic *ContainerEngine) containerCloneLive(ctx context.Context, opts entities
 	}
 	visibleCloneIDs := make([]string, 0, requestedCopies)
 	for i, cloneID := range cloneIDs {
-		clonePID, err := readTforkClonePID(cloneID, imgDir, i, copies)
+		clonePID, err := readTforkClonePID(cloneID, imgDir, i, copies, useNcopyRestore)
 		if err != nil {
 			return nil, fmt.Errorf("read clone %d PID: %w", i, err)
 		}
@@ -747,27 +737,10 @@ func (ic *ContainerEngine) containerCloneLive(ctx context.Context, opts entities
 			}
 		}
 		logrus.Infof("tfork: clone %s (%s) registered in libpod state, pid=%d", cloneID, cloneNames[i], clonePID)
-		if i >= requestedCopies {
-			if err := removeHiddenTforkClone(ctx, ic, ctr); err != nil {
-				logrus.Warnf("tfork: hidden spare clone %s cleanup failed: %v", cloneID, err)
-			} else {
-				logrus.Infof("tfork: hidden spare clone %s removed", cloneID)
-			}
-			continue
-		}
 		visibleCloneIDs = append(visibleCloneIDs, cloneID)
 	}
 
 	return &entities.ContainerCreateReport{Id: strings.Join(visibleCloneIDs, "\n")}, nil
-}
-
-func removeHiddenTforkClone(ctx context.Context, ic *ContainerEngine, ctr *libpod.Container) error {
-	oldNoReap, hadNoReap := os.LookupEnv("PODMAN_TFORK_NO_REAP")
-	if hadNoReap {
-		_ = os.Unsetenv("PODMAN_TFORK_NO_REAP")
-		defer os.Setenv("PODMAN_TFORK_NO_REAP", oldNoReap)
-	}
-	return ic.Libpod.RemoveContainer(ctx, ctr, true, true, nil)
 }
 
 type tforkCgroupFreezer struct {
@@ -1324,7 +1297,7 @@ func spawnTforkExitWatcher(ctx context.Context, rt *libpod.Runtime, ctr *libpod.
 	return nil
 }
 
-func readTforkClonePID(cloneID string, imgDir string, copyIdx, copies int) (int, error) {
+func readTforkClonePID(cloneID string, imgDir string, copyIdx, copies int, useNcopyRestore bool) (int, error) {
 	statePath := fmt.Sprintf("/run/crun/%s/status", cloneID)
 	if data, err := os.ReadFile(statePath); err == nil {
 		var st struct {
@@ -1335,7 +1308,7 @@ func readTforkClonePID(cloneID string, imgDir string, copyIdx, copies int) (int,
 		}
 	}
 	var pidFile string
-	if copies == 1 {
+	if !useNcopyRestore {
 		pidFile = filepath.Join(imgDir, "tfork.pid")
 	} else {
 		pidFile = filepath.Join(imgDir, fmt.Sprintf("tfork.pid.copy%d", copyIdx))
@@ -1348,7 +1321,7 @@ func readTforkClonePID(cloneID string, imgDir string, copyIdx, copies int) (int,
 	if err != nil {
 		return 0, err
 	}
-	if copies == 1 {
+	if !useNcopyRestore {
 		return rcPID, nil
 	}
 	initPID, err := readFirstChildPID(rcPID)

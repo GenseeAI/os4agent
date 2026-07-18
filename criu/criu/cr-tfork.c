@@ -271,7 +271,7 @@ open_snap_root:
 		return 0;
 
 	snap_path = opts.tfork.snap_root;
-	if (!snap_path && opts.tfork.copies > 1 && opts.tfork.snap_roots &&
+	if (!snap_path && opts.tfork.copies >= 1 && opts.tfork.snap_roots &&
 	    opts.tfork.copy_idx < opts.tfork.snap_roots_n)
 		snap_path = opts.tfork.snap_roots[opts.tfork.copy_idx];
 
@@ -1173,7 +1173,7 @@ int cr_tfork_tasks(pid_t pid)
 				rpc_argv[rpc_n++] = "--tfork-snap-mounts";
 				rpc_argv[rpc_n++] = snap_mounts_csv;
 			}
-			if (opts.tfork.copies > 1) {
+			if (opts.tfork.copies >= 1) {
 				snprintf(copies_arg, sizeof(copies_arg),
 					 "%d", opts.tfork.copies);
 				rpc_argv[rpc_n++] = "--tfork-copies";

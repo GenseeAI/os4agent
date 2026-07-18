@@ -332,7 +332,7 @@ int main(int argc, char *argv[], char *envp[])
 		if (opts.tree_id)
 			pr_warn("Using -t with criu restore is obsoleted\n");
 
-		if (opts.tfork.copies > 1) {
+		if (opts.tfork.active && opts.tfork.copies >= 1) {
 			int n = opts.tfork.copies, i;
 			pid_t *children;
 			int (*ready_pipes)[2];
@@ -348,14 +348,14 @@ int main(int argc, char *argv[], char *envp[])
 			const int ns_flags = CLONE_NEWNS;
 
 			if (!opts.tfork.active) {
-				pr_err("--tfork-copies>1 requires --tfork-restore "
+				pr_err("--tfork-copies requires --tfork-restore "
 				       "(use 'criu tfork --tfork-copies=N', not "
 				       "'criu restore --tfork-copies=N')\n");
 				return 1;
 			}
 
 			if (!opts.restore_detach) {
-				pr_err("--tfork-copies>1 requires --restore-detached\n");
+				pr_err("--tfork-copies requires --restore-detached\n");
 				return 1;
 			}
 

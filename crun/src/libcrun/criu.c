@@ -1513,7 +1513,7 @@ libcrun_container_tfork_linux_criu (libcrun_container_t *container, libcrun_chec
     return crun_make_error (err, 0,
                             "--tfork-snap-root, --tfork-snap-roots, or --tfork-copy=<i>::--tfork-snap-root=PATH is required");
 
-  if (cr_options->tfork_copies > 1 && cr_options->tfork_snap_roots_n > 0
+  if (cr_options->tfork_copies >= 1 && cr_options->tfork_snap_roots_n > 0
       && (size_t) cr_options->tfork_copies != cr_options->tfork_snap_roots_n)
     return crun_make_error (err, 0,
                             "--tfork-copies=%d but --tfork-snap-roots has %zu entries",
@@ -1631,7 +1631,7 @@ libcrun_container_tfork_linux_criu (libcrun_container_t *container, libcrun_chec
         }
     }
 
-  if (cr_options->tfork_copies > 1)
+  if (cr_options->tfork_copies >= 1)
     libcriu_wrapper->criu_set_tfork_copies (cr_options->tfork_copies);
 
   if (cr_options->tfork_memdump_async)
@@ -1860,7 +1860,7 @@ libcrun_container_tfork_linux_criu (libcrun_container_t *container, libcrun_chec
       pid_t clone_pid;
       const char *pidfile_name = "tfork.pid";
 
-      if (cr_options->tfork_copies > 1)
+      if (cr_options->tfork_copies >= 1)
         pidfile_name = "tfork.pid.copy0";
 
       ret = append_paths (&pidfile_path, err, cr_options->image_path, pidfile_name, NULL);
@@ -1875,7 +1875,7 @@ libcrun_container_tfork_linux_criu (libcrun_container_t *container, libcrun_chec
       if (UNLIKELY (clone_pid <= 0))
         return crun_make_error (err, 0, "invalid clone PID %d in `%s`", (int) clone_pid, pidfile_path);
 
-      if (cr_options->tfork_copies > 1)
+      if (cr_options->tfork_copies >= 1)
         {
           char children_path[64];
           cleanup_free char *children_buf = NULL;
