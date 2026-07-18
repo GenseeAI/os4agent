@@ -1270,8 +1270,12 @@ static int new_pid_ns_truncate_pid_hierarchy(pid_t *pid_max)
 	unsigned int ns_level_to_truncate;
 
 	clone_flags = get_clone_mask(root_item->ids, root_ids);
-	if (!(clone_flags & CLONE_NEWPID))
+	if (!(clone_flags & CLONE_NEWPID) &&
+	    !(opts.tfork.active && root_item->pid->ns_level > 1))
 		return 0;
+	if (!(clone_flags & CLONE_NEWPID))
+		pr_info("pidns: forcing tfork pid hierarchy truncation for root level=%d\n",
+			root_item->pid->ns_level);
 
 	if (root_item->pid->ns_level <= 1) {
 		pr_err("only 1 level of pid namespace, but CLONE_NEWPID is set, "
