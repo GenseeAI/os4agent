@@ -93,12 +93,22 @@ for mod in "${ACTIVE_MODULES[@]}"; do
     fi
 
     if lsmod | awk '{print $1}' | grep -qx "${mod}"; then
-        echo "  -- ${mod}: already loaded, rmmod then insmod"
+        echo "  -- ${mod}: already loaded, trying reload"
         rmmod "${mod}" 2>/dev/null || true
-    else
-        echo "  -- ${mod}: insmod"
+        if lsmod | awk '{print $1}' | grep -qx "${mod}"; then
+            echo "  -- ${mod}: still loaded; keeping existing module"
+            continue
+        fi
     fi
-    insmod "${ko_path}"
+
+    echo "  -- ${mod}: insmod"
+    if ! insmod "${ko_path}"; then
+        if lsmod | awk '{print $1}' | grep -qx "${mod}"; then
+            echo "  -- ${mod}: insmod reported already loaded; keeping existing module"
+            continue
+        fi
+        exit 1
+    fi
 done
 
 echo "  -- verify all modules loaded"
