@@ -1444,10 +1444,24 @@ static inline int fork_with_pid(struct pstree_item *item)
 		} else if (item->pid->ns_level == 1)
 			ret = clone3_with_pid_noasan(restore_task_with_children, &ca,
 						     ca.clone_flags & ~strip, SIGCHLD, pid);
-		else
+		else {
+			struct pid tfork_pid = {};
+			struct pid *restore_pid = item->pid;
+
+			if (opts.tfork.active && (root_ns_mask & CLONE_NEWPID) &&
+			    root_item && root_item->pid->ns_level > 1 &&
+			    item->pid->ns_level > 1) {
+				tfork_pid = *item->pid;
+				tfork_pid.ns_level--;
+				restore_pid = &tfork_pid;
+				pr_info("tfork: restore pid uid=%d local=%d with rebased pid chain level %d -> %d\n",
+					uid(item), pid, item->pid->ns_level,
+					restore_pid->ns_level);
+			}
 			ret = clone3_with_nested_pid_noasan(restore_task_with_children, &ca,
 							    ca.clone_flags & ~strip,
-							    SIGCHLD, item->pid);
+							    SIGCHLD, restore_pid);
+		}
 	} else {
 		BUG_ON(item->pid->ns_level >= 1);
 		close_pid_proc();
