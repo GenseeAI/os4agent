@@ -1566,6 +1566,7 @@ libcrun_container_tfork_linux_criu (libcrun_container_t *container, libcrun_chec
 
   libcriu_wrapper->criu_set_pid (source_pid);
   libcriu_wrapper->criu_set_leave_running (true);
+  libcriu_wrapper->criu_set_ext_unix_sk (cr_options->ext_unix_sk);
   libcriu_wrapper->criu_set_file_locks (true);
 
   cgroup_mode = libcrun_get_cgroup_mode (err);
