@@ -189,9 +189,9 @@ static int __restore_wait_inprogress_tasks(int participants)
 	futex_wait_while_gt(np, participants);
 	ret = (int)futex_get(np);
 	if (ret < 0) {
-		pr_err("restore wait aborted: participants=%d nr_in_progress=%d start_stage=%d cr_err=%d task_cr_err=%d\n",
+		pr_err("restore wait aborted: participants=%d nr_in_progress=%d start_stage=%d task_cr_err=%d\n",
 		       participants, ret, (int)futex_get(&task_entries->start),
-		       (int)futex_get(&task_entries->cr_err), get_task_cr_err());
+		       get_task_cr_err());
 		set_cr_errno(get_task_cr_err());
 		return ret;
 	}
