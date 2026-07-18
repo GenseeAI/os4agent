@@ -4087,6 +4087,7 @@ static int sigreturn_restore(struct task_restore_args *task_args, unsigned long 
 	task_args->vdso_rt_size = vdso_rt_size;
 	task_args->can_map_vdso = kdat.can_map_vdso;
 	task_args->has_clone3_set_tid = kdat.has_clone3_set_tid;
+	task_args->tfork_active = opts.tfork.active;
 
 	new_sp = restorer_stack(task_args->t->mz);
 

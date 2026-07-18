@@ -2465,6 +2465,14 @@ tfork_skip_page_restore:
 				c_args.set_tid = ptr_to_u64(thread_args[i].tid_in_ns);
 				c_args.flags = clone_flags;
 				c_args.set_tid_size = thread_args[i].ns_level;
+				if (args->tfork_active && thread_args[i].ns_level > 1) {
+					pr_info("tfork: restore thread pid=%d with fresh parent tid, set_tid_size %d -> 1 tids=%d/%d\n",
+						thread_args[i].pid,
+						thread_args[i].ns_level,
+						thread_args[i].tid_in_ns[0],
+						thread_args[i].tid_in_ns[1]);
+					c_args.set_tid_size = 1;
+				}
 				/* The kernel does stack + stack_size. */
 				c_args.stack = new_sp - RESTORE_STACK_SIZE;
 				c_args.stack_size = RESTORE_STACK_SIZE;
@@ -2495,7 +2503,14 @@ tfork_skip_page_restore:
 						     args->clone_restore_fn);
 			}
 			if (ret != thread_args[i].pid) {
-				pr_err("Unable to create a thread: %ld\n", ret);
+				pr_err("Unable to create a thread: %ld expected=%d ns_level=%d tids=%d/%d/%d/%d tfork=%d\n",
+				       ret, thread_args[i].pid,
+				       thread_args[i].ns_level,
+				       thread_args[i].tid_in_ns[0],
+				       thread_args[i].ns_level > 1 ? thread_args[i].tid_in_ns[1] : -1,
+				       thread_args[i].ns_level > 2 ? thread_args[i].tid_in_ns[2] : -1,
+				       thread_args[i].ns_level > 3 ? thread_args[i].tid_in_ns[3] : -1,
+				       args->tfork_active ? 1 : 0);
 				sys_close(fd);
 				mutex_unlock(&task_entries_local->last_pid_mutex);
 				goto core_restore_end;
