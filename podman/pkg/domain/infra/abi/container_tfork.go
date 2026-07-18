@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -16,7 +17,6 @@ import (
 
 	"github.com/containers/podman/v5/libpod"
 	"github.com/containers/podman/v5/libpod/define"
-	"strconv"
 
 	"github.com/containers/podman/v5/pkg/domain/entities"
 	"github.com/containers/podman/v5/utils"
@@ -31,10 +31,22 @@ const (
 	tforkSourceFreezeTimeout = 10 * time.Second
 	tforkSourceThawTimeout   = 10 * time.Second
 	tforkCloneReadyTimeout   = 60 * time.Second
-	tforkCrunFinishTimeout   = tforkCloneReadyTimeout
 	tforkCgroupPollInterval  = 50 * time.Millisecond
 	tforkClonePollInterval   = 200 * time.Millisecond
 )
+
+func tforkCloneReadyTimeoutFromEnv() time.Duration {
+	value := strings.TrimSpace(os.Getenv("PODMAN_TFORK_CLONE_READY_TIMEOUT_SECS"))
+	if value == "" {
+		return tforkCloneReadyTimeout
+	}
+	seconds, err := strconv.Atoi(value)
+	if err != nil || seconds <= 0 {
+		logrus.Warnf("tfork: ignoring invalid PODMAN_TFORK_CLONE_READY_TIMEOUT_SECS=%q", value)
+		return tforkCloneReadyTimeout
+	}
+	return time.Duration(seconds) * time.Second
+}
 
 func (ic *ContainerEngine) containerCloneLive(ctx context.Context, opts entities.ContainerCloneOptions) (rep *entities.ContainerCreateReport, retErr error) {
 	src, err := ic.Libpod.LookupContainer(opts.ID)
@@ -596,7 +608,8 @@ func (ic *ContainerEngine) containerCloneLive(ctx context.Context, opts entities
 		}
 		statePath := fmt.Sprintf("/run/crun/%s/status", cloneIDs[0])
 		needState := copies == 1
-		deadline := time.Now().Add(tforkCloneReadyTimeout)
+		cloneReadyTimeout := tforkCloneReadyTimeoutFromEnv()
+		deadline := time.Now().Add(cloneReadyTimeout)
 		readyCopies := 0
 		stateReady := !needState
 		crunExited := false
@@ -641,11 +654,11 @@ func (ic *ContainerEngine) containerCloneLive(ctx context.Context, opts entities
 			select {
 			case crunErr = <-crunDone:
 				crunExited = true
-			case <-time.After(tforkCrunFinishTimeout):
+			case <-time.After(cloneReadyTimeout):
 				tforkAbortCrunCmd(crunCmd, src, bundleDir, copies)
 				crunAborted = true
 				return nil, fmt.Errorf("timeout waiting %s for crun tfork to finish after %d clones came up; see %s",
-					tforkCrunFinishTimeout, copies, logPath)
+					cloneReadyTimeout, copies, logPath)
 			}
 		}
 		if crunErr != nil {
