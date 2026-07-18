@@ -97,6 +97,7 @@ static pid_t *helpers;
 static int n_helpers;
 static pid_t *zombies;
 static int n_zombies;
+static bool tfork_active_local;
 static enum faults fi_strategy;
 bool fault_injected(enum faults f)
 {
@@ -164,6 +165,13 @@ static void sigchld_handler(int signal, siginfo_t *siginfo, void *data)
 
 	pr_err("SIGCHLD during restore: task %d %s %d\n",
 	       siginfo->si_pid, r, siginfo->si_status);
+	if (tfork_active_local &&
+	    siginfo->si_code == CLD_EXITED &&
+	    siginfo->si_status == 0) {
+		pr_info("tfork: ignoring clean child exit during restore: task %d\n",
+			siginfo->si_pid);
+		return;
+	}
 
 	futex_abort_and_wake(&task_entries_local->nr_in_progress);
 	/* sa_restorer may be unmaped, so we can't go back to userspace*/
@@ -1761,6 +1769,7 @@ __visible long __export_restore_task(struct task_restore_args *args)
 	fi_strategy = args->fault_strategy;
 
 	task_entries_local = args->task_entries;
+	tfork_active_local = args->tfork_active;
 	helpers = args->helpers;
 	n_helpers = args->helpers_n;
 	zombies = args->zombies;
