@@ -1395,6 +1395,16 @@ static inline int fork_with_pid(struct pstree_item *item)
 
 	ca.item = item;
 	ca.clone_flags = rsti(item)->clone_flags;
+	if (opts.tfork.active && item != root_item &&
+	    !(ca.clone_flags & CLONE_NEWPID) &&
+	    item->pid->ns_level > 1 &&
+	    item->pid->ns[0].ns_pid == INIT_PID) {
+		pr_info("tfork: repairing missing CLONE_NEWPID for pidns init uid=%d local=%d parent_local=%d level=%d\n",
+			uid(item), pid,
+			item->parent ? localpid(item->parent) : -1,
+			item->pid->ns_level);
+		ca.clone_flags |= CLONE_NEWPID;
+	}
 
 	BUG_ON(ca.clone_flags & CLONE_VM);
 
