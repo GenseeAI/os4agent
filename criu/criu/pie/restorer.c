@@ -825,11 +825,17 @@ __visible long __export_restore_thread(struct thread_restore_args *args)
 	}
 
 	pr_info("%ld: Restored\n", sys_gettid());
+	if (args->ta->tfork_active)
+		pr_warn("tfork: thread restore stage complete pid=%d tid=%ld comm=%s ns_level=%d\n",
+			args->pid, sys_gettid(), args->comm, args->ns_level);
 	restore_finish_stage(task_entries_local, CR_STATE_RESTORE);
 
 	if (restore_signals(args->siginfo, args->siginfo_n, false)){
 		goto core_restore_end;
 	}
+	if (args->ta->tfork_active)
+		pr_warn("tfork: thread sigchld stage complete pid=%d tid=%ld comm=%s ns_level=%d\n",
+			args->pid, sys_gettid(), args->comm, args->ns_level);
 	restore_finish_stage(task_entries_local, CR_STATE_RESTORE_SIGCHLD);
 
 	/*
@@ -2566,6 +2572,10 @@ tfork_skip_page_restore:
 	if (restore_membarrier_registrations(args->membarrier_registration_mask) < 0)
 		goto core_restore_end;
 	pr_info("%ld: Restored\n", sys_getpid());
+	if (args->tfork_active)
+		pr_warn("tfork: leader restore stage complete pid=%d tid=%ld comm=%s threads=%d ns_level=%d\n",
+			args->t->pid, sys_getpid(), args->comm, args->nr_threads,
+			args->t->ns_level);
 
 	restore_finish_stage(task_entries_local, CR_STATE_RESTORE);
 
@@ -2609,6 +2619,10 @@ tfork_skip_page_restore:
 	if (ret)
 		goto core_restore_end;
 
+	if (args->tfork_active)
+		pr_warn("tfork: leader sigchld stage complete pid=%d tid=%ld comm=%s threads=%d ns_level=%d\n",
+			args->t->pid, sys_getpid(), args->comm, args->nr_threads,
+			args->t->ns_level);
 	restore_finish_stage(task_entries_local, CR_STATE_RESTORE_SIGCHLD);
 
 	rst_tcp_socks_all(args);
