@@ -56,11 +56,12 @@ func (ic *ContainerEngine) containerCloneLive(ctx context.Context, opts entities
 	}
 	requestedCopies := copies
 	useSingleCopyConmon := requestedCopies == 1 && os.Getenv("PODMAN_TFORK_SINGLE_COPY_CONMON") == "1"
-	if requestedCopies == 1 && !useSingleCopyConmon {
-		// The CRIU/crun single-copy tfork path can abort before producing a
-		// clone PID (`free(): invalid pointer`). Run a two-copy batch internally
-		// to use the known-good batch path, then remove the hidden spare clone
-		// before returning to the caller.
+	useHiddenSpareCopy := requestedCopies == 1 && os.Getenv("PODMAN_TFORK_HIDDEN_SPARE_COPY") == "1"
+	if useHiddenSpareCopy && !useSingleCopyConmon {
+		// Older tfork experiments used a two-copy batch internally to avoid
+		// single-copy restore bugs, then removed the hidden spare. Keep that
+		// path available for diagnostics, but make the requested single-copy
+		// direct-crun path the default.
 		copies = 2
 	}
 
