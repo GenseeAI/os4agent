@@ -186,7 +186,27 @@ static int __restore_wait_inprogress_tasks(int participants)
 	int ret;
 	futex_t *np = &task_entries->nr_in_progress;
 
-	futex_wait_while_gt(np, participants);
+	if (opts.tfork.active) {
+		int waited;
+
+		for (waited = 0; waited < 100; waited++) {
+			if ((int)futex_get(np) <= participants)
+				break;
+			usleep(100000);
+		}
+
+		if ((int)futex_get(np) > participants) {
+			pr_err("tfork restore wait timed out: participants=%d nr_in_progress=%d start_stage=%d nr_tasks=%d nr_threads=%d nr_helpers=%d\n",
+			       participants, (int)futex_get(np),
+			       (int)futex_get(&task_entries->start),
+			       task_entries->nr_tasks, task_entries->nr_threads,
+			       task_entries->nr_helpers);
+			return -ETIMEDOUT;
+		}
+	} else {
+		futex_wait_while_gt(np, participants);
+	}
+
 	ret = (int)futex_get(np);
 	if (ret < 0) {
 		pr_err("restore wait aborted: participants=%d nr_in_progress=%d start_stage=%d task_cr_err=%d\n",
@@ -230,9 +250,17 @@ static inline void __restore_switch_stage(int next_stage)
 
 static int restore_switch_stage(int next_stage)
 {
-	pr_info("restore_switch_stage %d participants=%d nr_tasks=%d nr_threads=%d nr_helpers=%d\n",
-		next_stage, stage_participants(next_stage), task_entries->nr_tasks,
-		task_entries->nr_threads, task_entries->nr_helpers);
+	if (opts.tfork.active)
+		pr_warn("tfork: restore_switch_stage %d participants=%d nr_tasks=%d nr_threads=%d nr_helpers=%d\n",
+			next_stage, stage_participants(next_stage),
+			task_entries->nr_tasks, task_entries->nr_threads,
+			task_entries->nr_helpers);
+	else
+		pr_info("restore_switch_stage %d participants=%d nr_tasks=%d nr_threads=%d nr_helpers=%d\n",
+			next_stage, stage_participants(next_stage),
+			task_entries->nr_tasks, task_entries->nr_threads,
+			task_entries->nr_helpers);
+
 	__restore_switch_stage(next_stage);
 	return restore_wait_inprogress_tasks();
 }
