@@ -150,6 +150,14 @@ static void sigchld_handler(int signal, siginfo_t *siginfo, void *data)
 		if (siginfo->si_pid == zombies[i])
 			return;
 
+	if (tfork_active_local &&
+	    siginfo->si_code == CLD_EXITED &&
+	    siginfo->si_status == 0) {
+		pr_info("tfork: ignoring clean child exit during restore: task %d\n",
+			siginfo->si_pid);
+		return;
+	}
+
 	if (siginfo->si_code == CLD_EXITED)
 		r = "exited, status=";
 	else if (siginfo->si_code == CLD_KILLED)
@@ -165,13 +173,6 @@ static void sigchld_handler(int signal, siginfo_t *siginfo, void *data)
 
 	pr_err("SIGCHLD during restore: task %d %s %d\n",
 	       siginfo->si_pid, r, siginfo->si_status);
-	if (tfork_active_local &&
-	    siginfo->si_code == CLD_EXITED &&
-	    siginfo->si_status == 0) {
-		pr_info("tfork: ignoring clean child exit during restore: task %d\n",
-			siginfo->si_pid);
-		return;
-	}
 
 	futex_abort_and_wake(&task_entries_local->nr_in_progress);
 	/* sa_restorer may be unmaped, so we can't go back to userspace*/
