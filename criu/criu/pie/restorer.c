@@ -1506,6 +1506,11 @@ static int wait_zombies(struct task_restore_args *task_args)
 
 		ret = sys_waitid(P_PID, task_args->zombies[i], NULL, WNOWAIT | WEXITED, NULL);
 		if (ret == -ECHILD) {
+			if (task_args->tfork_active) {
+				pr_warn("tfork: zombie pid %d is not reparented to task %ld; skipping wait to avoid restore barrier deadlock\n",
+					task_args->zombies[i], sys_getpid());
+				continue;
+			}
 			/* A process isn't reparented to this task yet.
 			 * Let's wait when someone complete this stage
 			 * and try again.
