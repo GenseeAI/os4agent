@@ -2485,7 +2485,7 @@ tfork_skip_page_restore:
 				c_args.set_tid = ptr_to_u64(thread_args[i].tid_in_ns);
 				c_args.flags = clone_flags;
 				c_args.set_tid_size = thread_args[i].ns_level;
-				if (args->tfork_active) {
+				if (args->tfork_active && thread_args[i].ns_level > 0) {
 					/*
 					 * Preserve the TID visible in the clone's innermost PID namespace.
 					 * Outer namespace TIDs are allocated by the kernel so concurrent

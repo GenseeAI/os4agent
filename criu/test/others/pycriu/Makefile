@@ -13,7 +13,8 @@ CRIU_SOCKET := $(BUILD_DIR)/$(SOCKET_NAME)
 STATUS_FIFO := $(BUILD_DIR)/startup.status
 STATUS_FD := 200
 
-run: pstree-compat start
+run: pstree-compat
+	$(MAKE) --no-print-directory start
 	cleanup() { $(MAKE) --no-print-directory stop || true; }
 	trap cleanup EXIT INT TERM
 	"$(PYTHON)" test_check.py

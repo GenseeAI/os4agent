@@ -222,10 +222,14 @@ class pstree_handler:
         return message if message.IsInitialized() else None
 
     def load(self, f, pretty=False, no_payload=False):
+        # PSTREE has no out-of-band EXTRA data, so no_payload has no effect.
         payload = self._read_payload(f)
         if payload is None:
             return []
 
+        # Format detection intentionally relies on pstree_entry being proto2
+        # with required fields. A file-level payload may parse as that message,
+        # but it cannot be initialized because its wire fields have other types.
         legacy = self._parse(payload, pb.pstree_entry)
         if legacy is not None:
             entries = [legacy]
