@@ -1037,23 +1037,6 @@ static int open_inotify_fd(struct file_desc *d, int *new_fd)
 		return -1;
 	}
 
-	if (opts.tfork.active) {
-		unsigned int skipped = 0;
-
-		list_for_each_entry(wd_info, &info->marks, list)
-			skipped++;
-
-		if (skipped)
-			pr_warn("tfork: restored inotify fd %#08x without %u watch mark(s)\n",
-				info->ife->id, skipped);
-
-		if (restore_fown(tmp, info->ife->fown))
-			close_safe(&tmp);
-
-		*new_fd = tmp;
-		return tmp < 0 ? -1 : 0;
-	}
-
 	list_for_each_entry(wd_info, &info->marks, list) {
 		pr_info("\tRestore 0x%x wd for %#08x\n", wd_info->iwe->wd, wd_info->iwe->id);
 		if (restore_one_inotify(tmp, wd_info)) {

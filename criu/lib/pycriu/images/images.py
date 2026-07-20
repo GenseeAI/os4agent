@@ -43,6 +43,8 @@ import struct
 import os
 import array
 
+from google.protobuf.message import DecodeError
+
 from . import magic
 from . import pb
 from . import pb2dict
@@ -187,6 +189,94 @@ class entry_handler:
             f.seek(size, 1)
             entries += 1
 
+        return entries
+
+
+class pstree_handler:
+    """Read both legacy per-task and current file-level PSTREE images."""
+
+    @staticmethod
+    def _read_payload(f):
+        header = f.read(4)
+        if not header:
+            return None
+        if len(header) != 4:
+            raise ValueError("truncated PSTREE entry header")
+
+        size, = struct.unpack('i', header)
+        if size < 0:
+            raise ValueError("negative PSTREE entry size")
+
+        payload = f.read(size)
+        if len(payload) != size:
+            raise ValueError("truncated PSTREE entry payload")
+        return payload
+
+    @staticmethod
+    def _parse(payload, message_type):
+        message = message_type()
+        try:
+            message.ParseFromString(payload)
+        except DecodeError:
+            return None
+        return message if message.IsInitialized() else None
+
+    def load(self, f, pretty=False, no_payload=False):
+        payload = self._read_payload(f)
+        if payload is None:
+            return []
+
+        legacy = self._parse(payload, pb.pstree_entry)
+        if legacy is not None:
+            entries = [legacy]
+            while True:
+                payload = self._read_payload(f)
+                if payload is None:
+                    break
+                entry = self._parse(payload, pb.pstree_entry)
+                if entry is None:
+                    raise ValueError("invalid legacy PSTREE entry")
+                entries.append(entry)
+            return [pb2dict.pb2dict(entry, pretty) for entry in entries]
+
+        entry = self._parse(payload, pb.pstree_file_entry)
+        if entry is None:
+            raise ValueError("invalid PSTREE entry")
+        if self._read_payload(f) is not None:
+            raise ValueError("file-level PSTREE image has multiple entries")
+
+        return [pb2dict.pb2dict(entry, pretty)]
+
+    def loads(self, data, pretty=False):
+        return self.load(io.BytesIO(data), pretty)
+
+    def dump(self, entries, f):
+        if not entries:
+            return
+
+        file_level = ('tree' in entries[0] or
+                      'ns_max_pids' in entries[0])
+        if file_level and len(entries) != 1:
+            raise ValueError("file-level PSTREE image requires one entry")
+
+        message_type = (pb.pstree_file_entry if file_level
+                        else pb.pstree_entry)
+        for entry in entries:
+            message = message_type()
+            pb2dict.dict2pb(entry, message)
+            payload = message.SerializeToString()
+            f.write(struct.pack('i', len(payload)))
+            f.write(payload)
+
+    def dumps(self, entries):
+        f = io.BytesIO()
+        self.dump(entries, f)
+        return f.getvalue()
+
+    def count(self, f):
+        entries = 0
+        while self._read_payload(f) is not None:
+            entries += 1
         return entries
 
 
@@ -502,7 +592,7 @@ handlers = {
                                 tcp_stream_extra_handler()),
     'STATS': entry_handler(pb.stats_entry),
     'PAGEMAP': pagemap_handler(),  # Special one
-    'PSTREE': entry_handler(pb.pstree_file_entry),
+    'PSTREE': pstree_handler(),
     'REG_FILES': entry_handler(pb.reg_file_entry),
     'NS_FILES': entry_handler(pb.ns_file_entry),
     'EVENTFD_FILE': entry_handler(pb.eventfd_file_entry),

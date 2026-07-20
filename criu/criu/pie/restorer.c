@@ -763,16 +763,8 @@ __visible long __export_restore_thread(struct thread_restore_args *args)
 	int ret;
 
 	if (my_pid != args->pid) {
-		if (args->ta && args->ta->tfork_active) {
-			pr_info("tfork: accepting fresh thread tid %d instead of dumped tid %d\n",
-				my_pid, args->pid);
-			args->pid = my_pid;
-			if (args->ns_level > 0)
-				args->tid_in_ns[args->ns_level - 1] = my_pid;
-		} else {
-			pr_err("Thread pid mismatch %d/%d\n", my_pid, args->pid);
-			goto core_restore_end;
-		}
+		pr_err("Thread pid mismatch %d/%d\n", my_pid, args->pid);
+		goto core_restore_end;
 	}
 
 	/* restore original shadow stack */
@@ -2495,22 +2487,15 @@ tfork_skip_page_restore:
 				c_args.set_tid_size = thread_args[i].ns_level;
 				if (args->tfork_active) {
 					/*
-					 * tfork currently restores non-leader threads with fresh TIDs.
-					 * Reusing dumped TIDs collides with the synthetic per-copy restore
-					 * helper in nested PID namespaces; process IDs remain restored exactly.
-					 *
-					 * This can leave userspace thread-ID caches stale in the clone:
-					 * robust/errorcheck mutex owner futex words, cached gettid values
-					 * in TLS/TCB, and pthread_join targets derived from old pthread_t
-					 * values may not describe the clone's fresh worker TIDs.
+					 * Preserve the TID visible in the clone's innermost PID namespace.
+					 * Outer namespace TIDs are allocated by the kernel so concurrent
+					 * copy helpers cannot collide with each other on the host.
 					 */
-					pr_debug("tfork: restore thread pid=%d with fresh tid, set_tid_size %d -> 0 tids=%d/%d\n",
+					pr_debug("tfork: restore thread pid=%d with innermost tid=%d, set_tid_size %d -> 1\n",
 						thread_args[i].pid,
-						thread_args[i].ns_level,
 						thread_args[i].tid_in_ns[0],
-						thread_args[i].ns_level > 1 ? thread_args[i].tid_in_ns[1] : -1);
-					c_args.set_tid = 0;
-					c_args.set_tid_size = 0;
+						thread_args[i].ns_level);
+					c_args.set_tid_size = 1;
 				}
 				/* The kernel does stack + stack_size. */
 				c_args.stack = new_sp - RESTORE_STACK_SIZE;
@@ -2540,13 +2525,6 @@ tfork_skip_page_restore:
 				 */
 				RUN_CLONE_RESTORE_FN(ret, clone_flags, new_sp, parent_tid, thread_args,
 						     args->clone_restore_fn);
-			}
-			if (args->tfork_active && ret > 0 && ret != thread_args[i].pid) {
-				pr_info("tfork: thread tid remapped %d -> %ld\n",
-					thread_args[i].pid, ret);
-				thread_args[i].pid = ret;
-				if (thread_args[i].ns_level > 0)
-					thread_args[i].tid_in_ns[thread_args[i].ns_level - 1] = ret;
 			}
 			if (ret != thread_args[i].pid) {
 				pr_err("Unable to create a thread: %ld expected=%d ns_level=%d tids=%d/%d/%d/%d tfork=%d\n",

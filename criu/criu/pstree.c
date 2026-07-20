@@ -1049,6 +1049,7 @@ err:
 			list_del_init(&pi->sibling);
 		if (pid_inserted)
 			pstree_remove_pid_if_linked(pi->pid);
+		pi->pid->state = TASK_UNDEF;
 		if (threads_allocated) {
 			xfree(pi->threads);
 			pi->threads = NULL;
