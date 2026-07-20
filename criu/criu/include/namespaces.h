@@ -187,6 +187,7 @@ extern int restore_mnt_ns(int rst, int *cwd_fd);
 
 extern int dump_task_ns_ids(struct pstree_item *);
 extern int predump_task_ns_ids(struct pstree_item *);
+extern int finalize_nested_pid_ns_ids(void);
 extern int rst_add_ns_id(unsigned int id, struct pstree_item *, struct ns_desc *nd);
 extern struct ns_id *lookup_ns_by_id(unsigned int id, struct ns_desc *nd);
 

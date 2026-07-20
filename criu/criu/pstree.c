@@ -436,7 +436,10 @@ int dump_pstree(struct pstree_item *root_item)
 		pstree_entry__init(e);
 		tree_entries[nr_items++] = e;
 
-		pr_info("Process: %d(%d)\n", localpid(item), realpid(item));
+		pr_info("Process: %d(%d) uid=%d nsid=%d level=%d parent=%d parent_nsid=%d\n",
+			localpid(item), realpid(item), uid(item), item->pid->leaf_ns_id,
+			item->pid->ns_level, item->parent ? realpid(item->parent) : 0,
+			item->parent ? item->parent->pid->leaf_ns_id : -1);
 
 		e->realpid = realpid(item);
 		e->ppid = item->parent ? realpid(item->parent) : 0;
@@ -729,11 +732,37 @@ static int __pstree_insert_pid(struct pid *pid_node, struct rb_node *root_parent
 			rb_link_and_balance(&uid_root_rb, &pid_node->uid_node, parent, link);
 	}
 
-    return 0;
+	return 0;
 
 err:
-    rb_erase(&pid_node->root_ns_node, &pid_root_rb[ALL_PID_NS_ID]);
-    return -1;
+	rb_erase(&pid_node->root_ns_node, &pid_root_rb[ALL_PID_NS_ID]);
+	return -1;
+}
+
+static void pstree_remove_pid_if_linked(struct pid *pid_node)
+{
+	struct pid *found;
+	bool valid_leaf_ns = pid_node->leaf_ns_id >= 0 &&
+			     (unsigned int)pid_node->leaf_ns_id < pid_namespace_count;
+
+	if (pid_node->uid > 0) {
+		found = __lookup_pid_uid(&uid_root_rb, pid_node->uid, NULL, NULL);
+		if (found == pid_node)
+			rb_erase(&pid_node->uid_node, &uid_root_rb);
+	}
+
+	if (pid_node->leaf_ns_id != ALL_PID_NS_ID && valid_leaf_ns) {
+		found = __lookup_pid_leaf(&pid_root_rb[pid_node->leaf_ns_id],
+					  pid_node->local, NULL, NULL);
+		if (found == pid_node)
+			rb_erase(&pid_node->leaf_ns_node,
+				 &pid_root_rb[pid_node->leaf_ns_id]);
+	}
+
+	found = __lookup_pid_root(&pid_root_rb[ALL_PID_NS_ID],
+				  pid_node->real, NULL, NULL);
+	if (found == pid_node)
+		rb_erase(&pid_node->root_ns_node, &pid_root_rb[ALL_PID_NS_ID]);
 }
 
 int pstree_insert_pid(struct pid *pid_node)
@@ -741,13 +770,14 @@ int pstree_insert_pid(struct pid *pid_node)
 	return __pstree_insert_pid(pid_node, NULL, NULL);
 }
 
-static struct pstree_item *get_or_create_pstree_item(pid_t real, pid_t local, int pidns_id)
+static struct pstree_item *get_or_create_pstree_item(pid_t real, pid_t local, int pidns_id, bool *created)
 {
     struct pid *found;
     struct pstree_item *item;
-    struct rb_node **root_link, *root_parent;
 
-    found = __lookup_pid_root(&pid_root_rb[ALL_PID_NS_ID], real, &root_parent, &root_link);
+    *created = false;
+
+    found = __lookup_pid_root(&pid_root_rb[ALL_PID_NS_ID], real, NULL, NULL);
     if (found) {
         if (pidns_id != ALL_PID_NS_ID) {
             BUG_ON(found->leaf_ns_id != pidns_id || found->local != local);
@@ -762,11 +792,7 @@ static struct pstree_item *get_or_create_pstree_item(pid_t real, pid_t local, in
     item->pid->real = real;
     item->pid->local = local;
     item->pid->leaf_ns_id = pidns_id;
-
-    if (__pstree_insert_pid(item->pid, root_parent, root_link) < 0) {
-        xfree(item);
-        return NULL;
-    }
+    *created = true;
 
     return item;
 }
@@ -876,13 +902,24 @@ static int read_pstree_ids(struct pstree_item *pi)
  */
 static int read_one_pstree_item(PstreeEntry *e)
 {
-	struct pstree_item *pi;
-	int ret = -1, i, j;
+	struct pstree_item *pi = NULL;
+	int ret = -1, i, j, next_inserted_thread = 1;
+	bool linked = false, pid_inserted = false, threads_allocated = false;
+	bool created_item = false;
 
-	pi = get_or_create_pstree_item(e->realpid, e->localpid, e->nsid);
+	pi = get_or_create_pstree_item(e->realpid, e->localpid, e->nsid, &created_item);
 	if (!pi)
 		goto err;
+	/*
+	 * get_or_create_pstree_item() can only reuse an item that is still
+	 * TASK_UNDEF. Completed items are rejected here, so the unwind below
+	 * cannot tear down a previously parsed pstree item.
+	 */
 	BUG_ON(pi->pid->state != TASK_UNDEF);
+	if (!created_item && (pi->threads || pi->nr_threads)) {
+		pr_err("Refusing to reuse partially populated pstree item for %d\n", e->realpid);
+		goto err;
+	}
 
 	/*
 	 * Populate the ns-chain on pi from the thread-leader entry before
@@ -915,6 +952,27 @@ static int read_one_pstree_item(PstreeEntry *e)
 	}
 	pi->pid->state = TASK_ALIVE;
 	pi->pid->uid = e->uid;
+	pi->nr_threads = e->n_threads;
+	pi->threads = xmalloc(e->n_threads * sizeof(struct pid));
+	if (!pi->threads)
+		goto err;
+	threads_allocated = true;
+
+	/* note: we don't fail if we have empty ids */
+	if (read_pstree_ids(pi) < 0)
+		goto err;
+
+	if (pi->ids && pi->ids->has_pid_ns_id) {
+		if (pi->ids->pid_ns_id != pi->pid->leaf_ns_id) {
+			pr_warn("PID namespace id mismatch for uid %d: pstree=%d ids=%d, keeping pstree\n",
+				uid(pi), pi->pid->leaf_ns_id, pi->ids->pid_ns_id);
+			pi->ids->pid_ns_id = pi->pid->leaf_ns_id;
+		}
+	}
+
+	if (__pstree_insert_pid(pi->pid, NULL, NULL) < 0)
+		goto err;
+	pid_inserted = true;
 
 	if (e->ppid == 0) {
 		if (root_item) {
@@ -938,12 +996,8 @@ static int read_one_pstree_item(PstreeEntry *e)
 		parent = pid->item;
 		pi->parent = parent;
 		list_add(&pi->sibling, &parent->children);
+		linked = true;
 	}
-
-	pi->nr_threads = e->n_threads;
-	pi->threads = xmalloc(e->n_threads * sizeof(struct pid));
-	if (!pi->threads)
-		goto err;
 
 	for (i = 0; i < e->n_threads; i++) {
 		int insert_status;
@@ -960,7 +1014,7 @@ static int read_one_pstree_item(PstreeEntry *e)
 		pi->threads[i].state = TASK_THREAD;
 		pi->threads[i].item = NULL;
 		if (i == 0) {
-
+			/* The leader is indexed through pi->pid, not this mirror. */
 			pi->pid->ns_level = pi->threads[0].ns_level;
 			pi->pid->local = pi->threads[0].ns[0].ns_pid;
 			memcpy(pi->pid->ns, pi->threads[0].ns, e->threads[0]->n_ns * sizeof(struct pid_ns));
@@ -972,17 +1026,42 @@ static int read_one_pstree_item(PstreeEntry *e)
 			pr_err("Unexpected task %d in a tree %d\n", e->threads[i]->ns[0]->nspid, i);
 			goto err;
 		}
+		next_inserted_thread = i + 1;
 	}
 
 	task_entries->nr_threads += e->n_threads;
 	task_entries->nr_tasks++;
 
-	/* note: we don't fail if we have empty ids */
-	if (read_pstree_ids(pi) < 0)
-		goto err;
-
 	ret = 1;
 err:
+	if (ret < 0 && pi) {
+		/*
+		 * threads[0] is the leader mirrored by pi->pid. Only
+		 * non-leader threads are inserted independently, and
+		 * next_inserted_thread always points one past the last
+		 * successfully inserted non-leader slot.
+		 */
+		for (i = 1; i < next_inserted_thread; i++)
+			pstree_remove_pid_if_linked(&pi->threads[i]);
+		if (root_item == pi)
+			root_item = NULL;
+		if (linked)
+			list_del_init(&pi->sibling);
+		if (pid_inserted)
+			pstree_remove_pid_if_linked(pi->pid);
+		pi->pid->state = TASK_UNDEF;
+		if (threads_allocated) {
+			xfree(pi->threads);
+			pi->threads = NULL;
+			pi->nr_threads = 0;
+		}
+		/*
+		 * Restore pstree items come from the shared linear arena. The
+		 * item may no longer be the last allocation after read_pstree_ids(),
+		 * so it cannot be released individually. Restore teardown reclaims
+		 * the arena after this parse failure.
+		 */
+	}
 	return ret;
 }
 
@@ -1262,8 +1341,12 @@ static int new_pid_ns_truncate_pid_hierarchy(pid_t *pid_max)
 	unsigned int ns_level_to_truncate;
 
 	clone_flags = get_clone_mask(root_item->ids, root_ids);
-	if (!(clone_flags & CLONE_NEWPID))
+	if (!(clone_flags & CLONE_NEWPID) &&
+	    !(opts.tfork.active && root_item->pid->ns_level > 1))
 		return 0;
+	if (!(clone_flags & CLONE_NEWPID))
+		pr_info("pidns: forcing tfork pid hierarchy truncation for root level=%d\n",
+			root_item->pid->ns_level);
 
 	if (root_item->pid->ns_level <= 1) {
 		pr_err("only 1 level of pid namespace, but CLONE_NEWPID is set, "
@@ -1272,6 +1355,8 @@ static int new_pid_ns_truncate_pid_hierarchy(pid_t *pid_max)
 	}
 
 	ns_level_to_truncate = root_item->pid->ns_level - 1;
+	pr_info("pidns: truncating %u outer pid namespace level(s) for new root pid namespace\n",
+		ns_level_to_truncate);
 
 	for (node = rb_first(&pid_root_rb[ALL_PID_NS_ID]); node; ) {
 		next = rb_next(node);
@@ -1279,9 +1364,15 @@ static int new_pid_ns_truncate_pid_hierarchy(pid_t *pid_max)
 		pid_node = rb_entry(node, struct pid, root_ns_node);
 		rb_erase(node, &pid_root_rb[ALL_PID_NS_ID]);
 
+		pr_info("pidns: truncate before uid=%d real=%d local=%d level=%d\n",
+			pid_node->uid, pid_node->real, pid_node->local,
+			pid_node->ns_level);
 		pid_node->ns_level -= ns_level_to_truncate;
 		BUG_ON(pid_node->ns_level <= 0);
 		pid_node->real = pid_node->ns[pid_node->ns_level - 1].ns_pid;
+		pr_info("pidns: truncate after uid=%d real=%d local=%d level=%d\n",
+			pid_node->uid, pid_node->real, pid_node->local,
+			pid_node->ns_level);
 
 		found = __lookup_pid_root(&new_real_rbtree, pid_node->real, &parent, &link);
 		if (found) {

@@ -271,7 +271,7 @@ open_snap_root:
 		return 0;
 
 	snap_path = opts.tfork.snap_root;
-	if (!snap_path && opts.tfork.copies > 1 && opts.tfork.snap_roots &&
+	if (!snap_path && opts.tfork.copies >= 1 && opts.tfork.snap_roots &&
 	    opts.tfork.copy_idx < opts.tfork.snap_roots_n)
 		snap_path = opts.tfork.snap_roots[opts.tfork.copy_idx];
 
@@ -966,8 +966,9 @@ int cr_tfork_tasks(pid_t pid)
 		opts.tfork.pidfd_map[opts.tfork.pidfd_map_nr].pidfd = pidfd;
 		opts.tfork.pidfd_map[opts.tfork.pidfd_map_nr].memfd = -1;
 		opts.tfork.pidfd_map_nr++;
-		pr_info("tfork: pidfd %d for pid %d (vpid %d uid %d)\n",
-			pidfd, item->pid->real, localpid(item), uid(item));
+		pr_info("tfork: pidfd %d for pid %d (vpid %d uid %d nsid %d level %d)\n",
+			pidfd, item->pid->real, localpid(item), uid(item),
+			item->pid->leaf_ns_id, item->pid->ns_level);
 	}
 
 	ret = run_scripts(ACT_PRE_TFORK_RESTORE);
@@ -1078,7 +1079,7 @@ int cr_tfork_tasks(pid_t pid)
 			list_for_each_entry(cgo_iter, &opts.new_cgroup_roots, node)
 				rpc_n_cg_root++;
 
-			rpc_max = 32 + 2 * (rpc_n_ifd + rpc_n_ext + rpc_n_cg_root
+			rpc_max = 33 + 2 * (rpc_n_ifd + rpc_n_ext + rpc_n_cg_root
 					    + opts.tfork.snap_mount_n)
 				+ rpc_n_copy_args + 2;
 			rpc_argv = calloc(rpc_max, sizeof(*rpc_argv));
@@ -1098,6 +1099,7 @@ int cr_tfork_tasks(pid_t pid)
 			rpc_argv[rpc_n++] = "-o";
 			rpc_argv[rpc_n++] = restore_log_arg;
 			rpc_argv[rpc_n++] = "-v2";
+			rpc_argv[rpc_n++] = "--keep-pid-hierarchy";
 
 			if (opts.root) {
 				rpc_argv[rpc_n++] = "--root";
@@ -1171,7 +1173,7 @@ int cr_tfork_tasks(pid_t pid)
 				rpc_argv[rpc_n++] = "--tfork-snap-mounts";
 				rpc_argv[rpc_n++] = snap_mounts_csv;
 			}
-			if (opts.tfork.copies > 1) {
+			if (opts.tfork.copies >= 1) {
 				snprintf(copies_arg, sizeof(copies_arg),
 					 "%d", opts.tfork.copies);
 				rpc_argv[rpc_n++] = "--tfork-copies";
@@ -1267,7 +1269,7 @@ int cr_tfork_tasks(pid_t pid)
 		buf[off] = '\0';
 		end = buf + off;
 
-		argv_max = 8 + 2;
+		argv_max = 8 + 3;
 		for (p = buf; p < end; p++)
 			if (*p == '\0')
 				argv_max++;
@@ -1312,6 +1314,11 @@ int cr_tfork_tasks(pid_t pid)
 			argv_new[argc_new++] = "--pidfile";
 			argv_new[argc_new++] = pidfile_arg;
 		}
+		if ((size_t)argc_new + 1 >= argv_max) {
+			pr_err("tfork restore argv overflow: used=%d max=%zu\n", argc_new, argv_max);
+			exit(1);
+		}
+		argv_new[argc_new++] = "--keep-pid-hierarchy";
 		argv_new[argc_new] = NULL;
 
 		execv("/proc/self/exe", argv_new);

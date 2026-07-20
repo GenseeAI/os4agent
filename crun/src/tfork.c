@@ -83,7 +83,7 @@ static struct argp_option options[]
         { "parent-path", OPTION_PARENT_PATH, "DIR", 0, "previous criu images dir, for incremental memdump chains", 0 },
         { "tfork-memdump", OPTION_TFORK_MEMDUMP, 0, 0, "dump pages-*.img to image-path during tfork", 0 },
         { "tfork-memdump-async", OPTION_TFORK_MEMDUMP_ASYNC, 0, 0, "async page dump (implies --tfork-memdump)", 0 },
-        { "tfork-copies", OPTION_TFORK_COPIES, "N", 0, "produce N parallel clones (default 1)", 0 },
+        { "tfork-copies", OPTION_TFORK_COPIES, "N", 0, "produce N clones through the n-copy helper (omitted: legacy direct single-copy)", 0 },
         { "track-mem", OPTION_TRACK_MEM, 0, 0, "arm soft-dirty for chained incremental dumps", 0 },
         { "manage-cgroups-mode", OPTION_MANAGE_CGROUPS_MODE, "MODE", 0,
           "cgroups mode: 'soft' (default), 'ignore', 'full' and 'strict'", 0 },
@@ -359,7 +359,14 @@ int
 crun_command_tfork (struct crun_global_arguments *global_args, int argc, char **argv, libcrun_error_t *err)
 {
   cr_options.manage_cgroups_mode = -1;
-  cr_options.tfork_copies = 1;
+  cr_options.tfork_copies = 0;
+  /*
+   * External Unix stream sockets can make Codex/tmux stacks dumpable, but they
+   * may hide unsupported socket topology. Keep the default fail-loud and expose
+   * this as an explicit escape hatch for agent integrations.
+   */
+  if (getenv ("CRUN_TFORK_EXT_UNIX_SK") != NULL)
+    cr_options.ext_unix_sk = true;
   cr_options.leave_running = true;
 
   return crun_run_create_internal (global_args, argc, argv, container_tfork, get_options, &crun_context, &run_argp,

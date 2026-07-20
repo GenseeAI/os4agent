@@ -592,6 +592,93 @@ static unsigned int get_ns_id(int pid, struct ns_desc *nd, protobuf_c_boolean *s
 	return __get_ns_id(pid, nd, supported, NULL);
 }
 
+static unsigned int add_nested_pid_leaf_ns_id(struct pstree_item *item)
+{
+	struct ns_id *nsid;
+
+	nsid = xzalloc(sizeof(*nsid));
+	if (!nsid)
+		return 0;
+
+	nsid->type = NS_OTHER;
+	nsid->kid = 0;
+	nsid->ns_populated = true;
+	nsid_add(nsid, &pid_ns_desc, ns_next_id++, localpid(item));
+
+	pr_info("Add nested pid leaf ns %d for task %d(%d), level %d\n",
+		nsid->id, localpid(item), realpid(item), item->pid->ns_level);
+	return nsid->id;
+}
+
+static unsigned int ensure_task_leaf_pid_ns_id(struct pstree_item *item);
+
+static unsigned int task_leaf_pid_ns_id(struct pstree_item *item, unsigned int proc_pid_ns_id)
+{
+	struct pstree_item *parent = item->parent;
+	unsigned int selected;
+
+	/*
+	 * os4agent stores localpid as the innermost NSpid (pid->ns[0]).
+	 * Keep pstree_entry.nsid at the same namespace level. Otherwise a
+	 * nested pid namespace init such as bwrap can become (nsid=N,
+	 * localpid=1) and collide with the container init in the same nsid.
+	 */
+	if (parent && ensure_task_leaf_pid_ns_id(parent) == 0)
+		return 0;
+
+	if (parent && parent->pid->leaf_ns_id != ALL_PID_NS_ID) {
+		if (item->pid->ns_level == parent->pid->ns_level) {
+			selected = parent->pid->leaf_ns_id;
+			goto out;
+		}
+		if (item->pid->ns_level > parent->pid->ns_level &&
+		    proc_pid_ns_id != parent->pid->leaf_ns_id) {
+			selected = proc_pid_ns_id;
+			goto out;
+		}
+		if (item->pid->ns_level > parent->pid->ns_level) {
+			selected = add_nested_pid_leaf_ns_id(item);
+			goto out;
+		}
+	}
+
+	selected = proc_pid_ns_id;
+
+out:
+	pr_info("pid leaf ns task=%d(%d) uid=%d level=%d parent_level=%d proc_nsid=%u parent_nsid=%d selected=%u\n",
+		localpid(item), realpid(item), uid(item), item->pid->ns_level,
+		parent ? parent->pid->ns_level : -1, proc_pid_ns_id,
+		parent ? parent->pid->leaf_ns_id : -1, selected);
+	return selected;
+}
+
+static unsigned int ensure_task_leaf_pid_ns_id(struct pstree_item *item)
+{
+	struct pstree_item *parent = item->parent;
+	unsigned int proc_pid_ns_id;
+
+	if (parent && ensure_task_leaf_pid_ns_id(parent) == 0)
+		return 0;
+
+	if (item->pid->leaf_ns_id != ALL_PID_NS_ID) {
+		if (!parent)
+			return item->pid->leaf_ns_id;
+		if (item->pid->ns_level == parent->pid->ns_level &&
+		    item->pid->leaf_ns_id == parent->pid->leaf_ns_id)
+			return item->pid->leaf_ns_id;
+		if (item->pid->ns_level > parent->pid->ns_level &&
+		    item->pid->leaf_ns_id != parent->pid->leaf_ns_id)
+			return item->pid->leaf_ns_id;
+	}
+
+	proc_pid_ns_id = get_ns_id(item->pid->real, &pid_ns_desc, NULL);
+	if (!proc_pid_ns_id)
+		return 0;
+
+	item->pid->leaf_ns_id = task_leaf_pid_ns_id(item, proc_pid_ns_id);
+	return item->pid->leaf_ns_id;
+}
+
 int dump_one_ns_file(int lfd, u32 id, const struct fd_parms *p)
 {
 	struct cr_img *img;
@@ -771,14 +858,36 @@ int dump_task_ns_ids(struct pstree_item *item)
 	int i;
 	int pid = item->pid->real;
 	TaskKobjIdsEntry *ids = item->ids;
+	struct pstree_item *parent = item->parent;
+	unsigned int proc_pid_ns_id;
 
 	ids->has_pid_ns_id = true;
-	ids->pid_ns_id = get_ns_id(pid, &pid_ns_desc, NULL);
+	proc_pid_ns_id = get_ns_id(pid, &pid_ns_desc, NULL);
+	if (!proc_pid_ns_id) {
+		pr_err("Can't make pidns id\n");
+		return -1;
+	}
+
+	if (parent && ensure_task_leaf_pid_ns_id(parent) == 0)
+		return -1;
+
+	ids->pid_ns_id = proc_pid_ns_id;
+	if (parent && item->pid->ns_level == parent->pid->ns_level)
+		ids->pid_ns_id = parent->pid->leaf_ns_id;
+	else if (parent && item->pid->ns_level > parent->pid->ns_level &&
+		 ids->pid_ns_id == parent->pid->leaf_ns_id)
+		ids->pid_ns_id = add_nested_pid_leaf_ns_id(item);
+
 	if (!ids->pid_ns_id) {
 		pr_err("Can't make pidns id\n");
 		return -1;
 	}
 	item->pid->leaf_ns_id = ids->pid_ns_id;
+
+	pr_info("dump pid ns task=%d(%d) uid=%d level=%d parent_level=%d proc_nsid=%u parent_nsid=%d selected=%u\n",
+		localpid(item), realpid(item), uid(item), item->pid->ns_level,
+		parent ? parent->pid->ns_level : -1, proc_pid_ns_id,
+		parent ? parent->pid->leaf_ns_id : -1, ids->pid_ns_id);
 
 	for (i = 0; i < item->nr_threads; i++)
 		item->threads[i].leaf_ns_id = ids->pid_ns_id;
@@ -860,6 +969,40 @@ int dump_task_ns_ids(struct pstree_item *item)
 	if (!ids->cgroup_ns_id) {
 		pr_err("Can't make cgroup id\n");
 		return -1;
+	}
+
+	return 0;
+}
+
+int finalize_nested_pid_ns_ids(void)
+{
+	struct pstree_item *item;
+
+	for_each_pstree_item(item) {
+		struct pstree_item *parent = item->parent;
+		unsigned int nsid;
+		int i;
+
+		if (!parent)
+			continue;
+		if (item->pid->ns_level <= parent->pid->ns_level)
+			continue;
+		if (item->pid->leaf_ns_id != parent->pid->leaf_ns_id)
+			continue;
+
+		nsid = add_nested_pid_leaf_ns_id(item);
+		if (!nsid)
+			return -1;
+
+		item->pid->leaf_ns_id = nsid;
+		for (i = 0; i < item->nr_threads; i++)
+			item->threads[i].leaf_ns_id = nsid;
+		if (item->ids && item->ids->has_pid_ns_id)
+			item->ids->pid_ns_id = nsid;
+
+		pr_info("finalize nested pid ns task=%d(%d) uid=%d level=%d parent_nsid=%d selected=%u\n",
+			localpid(item), realpid(item), uid(item), item->pid->ns_level,
+			parent->pid->leaf_ns_id, nsid);
 	}
 
 	return 0;

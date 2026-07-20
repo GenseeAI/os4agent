@@ -93,12 +93,25 @@ for mod in "${ACTIVE_MODULES[@]}"; do
     fi
 
     if lsmod | awk '{print $1}' | grep -qx "${mod}"; then
-        echo "  -- ${mod}: already loaded, rmmod then insmod"
-        rmmod "${mod}" 2>/dev/null || true
-    else
-        echo "  -- ${mod}: insmod"
+        echo "  -- ${mod}: already loaded, trying reload"
+        if ! rmmod "${mod}"; then
+            echo "build.sh: failed to unload loaded module ${mod}; aborting to avoid stale module" >&2
+            echo "build.sh: stop running tfork/podman containers that may still hold ${mod}, then retry" >&2
+            exit 1
+        fi
+        if lsmod | awk '{print $1}' | grep -qx "${mod}"; then
+            echo "build.sh: module ${mod} is still loaded after rmmod; aborting to avoid stale module" >&2
+            echo "build.sh: stop running tfork/podman containers that may still hold ${mod}, then retry" >&2
+            exit 1
+        fi
     fi
-    insmod "${ko_path}"
+
+    echo "  -- ${mod}: insmod"
+    if ! insmod "${ko_path}"; then
+        echo "build.sh: failed to insert rebuilt module ${mod} from ${ko_path}" >&2
+        echo "build.sh: if the old module is still active, stop running tfork/podman containers and rerun this script" >&2
+        exit 1
+    fi
 done
 
 echo "  -- verify all modules loaded"

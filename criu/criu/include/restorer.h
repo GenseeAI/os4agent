@@ -242,6 +242,7 @@ struct task_restore_args {
 	int child_subreaper;
 	int membarrier_registration_mask;
 	bool has_clone3_set_tid;
+	bool tfork_active;
 
 	/*
 	 * info about rseq from libc used to

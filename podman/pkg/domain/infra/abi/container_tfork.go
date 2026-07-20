@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -16,7 +17,6 @@ import (
 
 	"github.com/containers/podman/v5/libpod"
 	"github.com/containers/podman/v5/libpod/define"
-	"strconv"
 
 	"github.com/containers/podman/v5/pkg/domain/entities"
 	"github.com/containers/podman/v5/utils"
@@ -31,10 +31,22 @@ const (
 	tforkSourceFreezeTimeout = 10 * time.Second
 	tforkSourceThawTimeout   = 10 * time.Second
 	tforkCloneReadyTimeout   = 60 * time.Second
-	tforkCrunFinishTimeout   = tforkCloneReadyTimeout
 	tforkCgroupPollInterval  = 50 * time.Millisecond
 	tforkClonePollInterval   = 200 * time.Millisecond
 )
+
+func tforkCloneReadyTimeoutFromEnv() time.Duration {
+	value := strings.TrimSpace(os.Getenv("PODMAN_TFORK_CLONE_READY_TIMEOUT_SECS"))
+	if value == "" {
+		return tforkCloneReadyTimeout
+	}
+	seconds, err := strconv.Atoi(value)
+	if err != nil || seconds <= 0 {
+		logrus.Warnf("tfork: ignoring invalid PODMAN_TFORK_CLONE_READY_TIMEOUT_SECS=%q", value)
+		return tforkCloneReadyTimeout
+	}
+	return time.Duration(seconds) * time.Second
+}
 
 func (ic *ContainerEngine) containerCloneLive(ctx context.Context, opts entities.ContainerCloneOptions) (rep *entities.ContainerCreateReport, retErr error) {
 	src, err := ic.Libpod.LookupContainer(opts.ID)
@@ -54,6 +66,14 @@ func (ic *ContainerEngine) containerCloneLive(ctx context.Context, opts entities
 	if copies <= 0 {
 		copies = 1
 	}
+	requestedCopies := copies
+	useSingleCopyConmon := requestedCopies == 1 && os.Getenv("PODMAN_TFORK_SINGLE_COPY_CONMON") == "1"
+	// PODMAN_TFORK_SINGLE_COPY_DIRECT is a debugging escape hatch that skips
+	// the n-copy restore helper for single-copy experiments. Production paths
+	// keep the n-copy helper even for copies=1 so attach/status handling is
+	// consistent with multi-copy forks.
+	useSingleCopyDirect := requestedCopies == 1 && os.Getenv("PODMAN_TFORK_SINGLE_COPY_DIRECT") == "1"
+	useNcopyRestore := copies > 1 || (requestedCopies == 1 && !useSingleCopyConmon && !useSingleCopyDirect)
 
 	var srcRootfs string
 	if cfg := src.Config(); cfg != nil && cfg.ExternalSetup && cfg.Rootfs != "" {
@@ -303,7 +323,7 @@ func (ic *ContainerEngine) containerCloneLive(ctx context.Context, opts entities
 		"--source-state", srcStatePath,
 		"--image-path", imgDir,
 	}
-	if copies == 1 {
+	if !useNcopyRestore {
 		crunArgs = append(crunArgs, "--tfork-snap-root", cloneRootfsList[0])
 		crunArgs = append(crunArgs, "--tfork-snap-mount", "/")
 		if cloneCgroupPaths[0] != "" {
@@ -423,7 +443,9 @@ func (ic *ContainerEngine) containerCloneLive(ctx context.Context, opts entities
 		}
 	}()
 	hasTTY := len(ttySrcFds) > 0
-	useConmon := copies == 1
+	// Keep the legacy single-copy conmon bootstrap opt-in because it can fail
+	// before crun starts and report only `conmon reported pid=-1`.
+	useConmon := copies == 1 && useSingleCopyConmon
 
 	if useConmon {
 		conmonInheritFds := inheritFds
@@ -466,8 +488,8 @@ func (ic *ContainerEngine) containerCloneLive(ctx context.Context, opts entities
 		var perCopyExtraFiles []*os.File
 		var perCopyReadEnds []*os.File
 		var perCopyArgs []string
-		skipTtySrcFds := copies > 1 && hasTTY
-		if copies > 1 {
+		skipTtySrcFds := useNcopyRestore && hasTTY
+		if useNcopyRestore {
 			ifdsForPerCopy, stdioKeys := splitStdioInheritFds(inheritFds)
 			inheritFds = ifdsForPerCopy
 			extraFDBase := 3
@@ -573,14 +595,15 @@ func (ic *ContainerEngine) containerCloneLive(ctx context.Context, opts entities
 		}
 
 		pidFileFor := func(i int) string {
-			if copies == 1 {
+			if !useNcopyRestore {
 				return filepath.Join(imgDir, "tfork.pid")
 			}
 			return filepath.Join(imgDir, fmt.Sprintf("tfork.pid.copy%d", i))
 		}
 		statePath := fmt.Sprintf("/run/crun/%s/status", cloneIDs[0])
-		needState := copies == 1
-		deadline := time.Now().Add(tforkCloneReadyTimeout)
+		needState := !useNcopyRestore
+		cloneReadyTimeout := tforkCloneReadyTimeoutFromEnv()
+		deadline := time.Now().Add(cloneReadyTimeout)
 		readyCopies := 0
 		stateReady := !needState
 		crunExited := false
@@ -625,11 +648,11 @@ func (ic *ContainerEngine) containerCloneLive(ctx context.Context, opts entities
 			select {
 			case crunErr = <-crunDone:
 				crunExited = true
-			case <-time.After(tforkCrunFinishTimeout):
+			case <-time.After(cloneReadyTimeout):
 				tforkAbortCrunCmd(crunCmd, src, bundleDir, copies)
 				crunAborted = true
 				return nil, fmt.Errorf("timeout waiting %s for crun tfork to finish after %d clones came up; see %s",
-					tforkCrunFinishTimeout, copies, logPath)
+					cloneReadyTimeout, copies, logPath)
 			}
 		}
 		if crunErr != nil {
@@ -651,8 +674,9 @@ func (ic *ContainerEngine) containerCloneLive(ctx context.Context, opts entities
 	if srcCfg == nil {
 		return nil, fmt.Errorf("source %q: could not read libpod config", src.ID())
 	}
+	visibleCloneIDs := make([]string, 0, requestedCopies)
 	for i, cloneID := range cloneIDs {
-		clonePID, err := readTforkClonePID(cloneID, imgDir, i, copies)
+		clonePID, err := readTforkClonePID(cloneID, imgDir, i, copies, useNcopyRestore)
 		if err != nil {
 			return nil, fmt.Errorf("read clone %d PID: %w", i, err)
 		}
@@ -717,9 +741,10 @@ func (ic *ContainerEngine) containerCloneLive(ctx context.Context, opts entities
 			}
 		}
 		logrus.Infof("tfork: clone %s (%s) registered in libpod state, pid=%d", cloneID, cloneNames[i], clonePID)
+		visibleCloneIDs = append(visibleCloneIDs, cloneID)
 	}
 
-	return &entities.ContainerCreateReport{Id: strings.Join(cloneIDs, "\n")}, nil
+	return &entities.ContainerCreateReport{Id: strings.Join(visibleCloneIDs, "\n")}, nil
 }
 
 type tforkCgroupFreezer struct {
@@ -1276,7 +1301,7 @@ func spawnTforkExitWatcher(ctx context.Context, rt *libpod.Runtime, ctr *libpod.
 	return nil
 }
 
-func readTforkClonePID(cloneID string, imgDir string, copyIdx, copies int) (int, error) {
+func readTforkClonePID(cloneID string, imgDir string, copyIdx, copies int, useNcopyRestore bool) (int, error) {
 	statePath := fmt.Sprintf("/run/crun/%s/status", cloneID)
 	if data, err := os.ReadFile(statePath); err == nil {
 		var st struct {
@@ -1287,7 +1312,7 @@ func readTforkClonePID(cloneID string, imgDir string, copyIdx, copies int) (int,
 		}
 	}
 	var pidFile string
-	if copies == 1 {
+	if !useNcopyRestore {
 		pidFile = filepath.Join(imgDir, "tfork.pid")
 	} else {
 		pidFile = filepath.Join(imgDir, fmt.Sprintf("tfork.pid.copy%d", copyIdx))
@@ -1300,7 +1325,7 @@ func readTforkClonePID(cloneID string, imgDir string, copyIdx, copies int) (int,
 	if err != nil {
 		return 0, err
 	}
-	if copies == 1 {
+	if !useNcopyRestore {
 		return rcPID, nil
 	}
 	initPID, err := readFirstChildPID(rcPID)

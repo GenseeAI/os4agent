@@ -97,6 +97,7 @@ static pid_t *helpers;
 static int n_helpers;
 static pid_t *zombies;
 static int n_zombies;
+static bool tfork_active_local;
 static enum faults fi_strategy;
 bool fault_injected(enum faults f)
 {
@@ -162,7 +163,8 @@ static void sigchld_handler(int signal, siginfo_t *siginfo, void *data)
 	else
 		r = "disappeared with";
 
-	pr_info("Task %d %s %d\n", siginfo->si_pid, r, siginfo->si_status);
+	pr_err("SIGCHLD during restore: task %d %s %d\n",
+	       siginfo->si_pid, r, siginfo->si_status);
 
 	futex_abort_and_wake(&task_entries_local->nr_in_progress);
 	/* sa_restorer may be unmaped, so we can't go back to userspace*/
@@ -807,12 +809,24 @@ __visible long __export_restore_thread(struct thread_restore_args *args)
 	}
 
 	pr_info("%ld: Restored\n", sys_gettid());
-	restore_finish_stage(task_entries_local, CR_STATE_RESTORE);
+	if (args->ta->tfork_active)
+		pr_debug("tfork: thread restore stage complete pid=%d tid=%ld comm=%s ns_level=%d\n",
+			args->pid, sys_gettid(), args->comm, args->ns_level);
+	ret = restore_finish_stage(task_entries_local, CR_STATE_RESTORE);
+	if (args->ta->tfork_active)
+		pr_debug("tfork: thread restore barrier returned pid=%d tid=%ld comm=%s stage=%d\n",
+			args->pid, sys_gettid(), args->comm, ret);
 
 	if (restore_signals(args->siginfo, args->siginfo_n, false)){
 		goto core_restore_end;
 	}
-	restore_finish_stage(task_entries_local, CR_STATE_RESTORE_SIGCHLD);
+	if (args->ta->tfork_active)
+		pr_debug("tfork: thread sigchld stage complete pid=%d tid=%ld comm=%s ns_level=%d\n",
+			args->pid, sys_gettid(), args->comm, args->ns_level);
+	ret = restore_finish_stage(task_entries_local, CR_STATE_RESTORE_SIGCHLD);
+	if (args->ta->tfork_active)
+		pr_debug("tfork: thread sigchld barrier returned pid=%d tid=%ld comm=%s stage=%d\n",
+			args->pid, sys_gettid(), args->comm, ret);
 
 	/*
 	 * Make sure it's before creds, since it's privileged
@@ -1476,6 +1490,11 @@ static int wait_zombies(struct task_restore_args *task_args)
 
 		ret = sys_waitid(P_PID, task_args->zombies[i], NULL, WNOWAIT | WEXITED, NULL);
 		if (ret == -ECHILD) {
+			if (task_args->tfork_active) {
+				pr_warn("tfork: zombie pid %d is not reparented to task %ld; skipping wait to avoid restore barrier deadlock\n",
+					task_args->zombies[i], sys_getpid());
+				continue;
+			}
 			/* A process isn't reparented to this task yet.
 			 * Let's wait when someone complete this stage
 			 * and try again.
@@ -1752,6 +1771,7 @@ __visible long __export_restore_task(struct task_restore_args *args)
 	fi_strategy = args->fault_strategy;
 
 	task_entries_local = args->task_entries;
+	tfork_active_local = args->tfork_active;
 	helpers = args->helpers;
 	n_helpers = args->helpers_n;
 	zombies = args->zombies;
@@ -2465,6 +2485,18 @@ tfork_skip_page_restore:
 				c_args.set_tid = ptr_to_u64(thread_args[i].tid_in_ns);
 				c_args.flags = clone_flags;
 				c_args.set_tid_size = thread_args[i].ns_level;
+				if (args->tfork_active && thread_args[i].ns_level > 0) {
+					/*
+					 * Preserve the TID visible in the clone's innermost PID namespace.
+					 * Outer namespace TIDs are allocated by the kernel so concurrent
+					 * copy helpers cannot collide with each other on the host.
+					 */
+					pr_debug("tfork: restore thread pid=%d with innermost tid=%d, set_tid_size %d -> 1\n",
+						thread_args[i].pid,
+						thread_args[i].tid_in_ns[0],
+						thread_args[i].ns_level);
+					c_args.set_tid_size = 1;
+				}
 				/* The kernel does stack + stack_size. */
 				c_args.stack = new_sp - RESTORE_STACK_SIZE;
 				c_args.stack_size = RESTORE_STACK_SIZE;
@@ -2495,7 +2527,14 @@ tfork_skip_page_restore:
 						     args->clone_restore_fn);
 			}
 			if (ret != thread_args[i].pid) {
-				pr_err("Unable to create a thread: %ld\n", ret);
+				pr_err("Unable to create a thread: %ld expected=%d ns_level=%d tids=%d/%d/%d/%d tfork=%d\n",
+				       ret, thread_args[i].pid,
+				       thread_args[i].ns_level,
+				       thread_args[i].tid_in_ns[0],
+				       thread_args[i].ns_level > 1 ? thread_args[i].tid_in_ns[1] : -1,
+				       thread_args[i].ns_level > 2 ? thread_args[i].tid_in_ns[2] : -1,
+				       thread_args[i].ns_level > 3 ? thread_args[i].tid_in_ns[3] : -1,
+				       args->tfork_active ? 1 : 0);
 				sys_close(fd);
 				mutex_unlock(&task_entries_local->last_pid_mutex);
 				goto core_restore_end;
@@ -2524,13 +2563,33 @@ tfork_skip_page_restore:
 	if (restore_membarrier_registrations(args->membarrier_registration_mask) < 0)
 		goto core_restore_end;
 	pr_info("%ld: Restored\n", sys_getpid());
+	if (args->tfork_active)
+		pr_debug("tfork: leader restore stage complete pid=%d tid=%ld comm=%s threads=%d ns_level=%d\n",
+			args->t->pid, sys_getpid(), args->comm, args->nr_threads,
+			args->t->ns_level);
 
-	restore_finish_stage(task_entries_local, CR_STATE_RESTORE);
+	ret = restore_finish_stage(task_entries_local, CR_STATE_RESTORE);
+	if (args->tfork_active)
+		pr_debug("tfork: leader restore barrier returned pid=%d tid=%ld comm=%s stage=%ld helpers=%u zombies=%u inotify=%u\n",
+			args->t->pid, sys_getpid(), args->comm, ret,
+			args->helpers_n, args->zombies_n, args->inotify_fds_n);
 
+	if (args->tfork_active)
+		pr_debug("tfork: leader wait_helpers start pid=%d tid=%ld comm=%s helpers=%u\n",
+			args->t->pid, sys_getpid(), args->comm, args->helpers_n);
 	if (wait_helpers(args) < 0)
 		goto core_restore_end;
+	if (args->tfork_active)
+		pr_debug("tfork: leader wait_helpers done pid=%d tid=%ld comm=%s\n",
+			args->t->pid, sys_getpid(), args->comm);
+	if (args->tfork_active)
+		pr_debug("tfork: leader wait_zombies start pid=%d tid=%ld comm=%s zombies=%u\n",
+			args->t->pid, sys_getpid(), args->comm, args->zombies_n);
 	if (wait_zombies(args) < 0)
 		goto core_restore_end;
+	if (args->tfork_active)
+		pr_debug("tfork: leader wait_zombies done pid=%d tid=%ld comm=%s\n",
+			args->t->pid, sys_getpid(), args->comm);
 
 	ksigfillset(&to_block);
 	ret = sys_sigprocmask(SIG_SETMASK, &to_block, NULL, sizeof(k_rtsigset_t));
@@ -2539,9 +2598,18 @@ tfork_skip_page_restore:
 		goto core_restore_end;
 	}
 
+	if (args->tfork_active)
+		pr_debug("tfork: leader cleanup_inotify start pid=%d tid=%ld comm=%s inotify=%u\n",
+			args->t->pid, sys_getpid(), args->comm, args->inotify_fds_n);
 	if (cleanup_current_inotify_events(args))
 		goto core_restore_end;
+	if (args->tfork_active)
+		pr_debug("tfork: leader cleanup_inotify done pid=%d tid=%ld comm=%s\n",
+			args->t->pid, sys_getpid(), args->comm);
 
+	if (args->tfork_active)
+		pr_debug("tfork: leader restore sigaction start pid=%d tid=%ld comm=%s\n",
+			args->t->pid, sys_getpid(), args->comm);
 	if (!args->compatible_mode) {
 		ret = sys_sigaction(SIGCHLD, &args->sigchld_act, NULL, sizeof(k_rtsigset_t));
 	} else {
@@ -2558,16 +2626,38 @@ tfork_skip_page_restore:
 		pr_err("Failed to restore SIGCHLD: %ld\n", ret);
 		goto core_restore_end;
 	}
+	if (args->tfork_active)
+		pr_debug("tfork: leader restore sigaction done pid=%d tid=%ld comm=%s\n",
+			args->t->pid, sys_getpid(), args->comm);
 
+	if (args->tfork_active)
+		pr_debug("tfork: leader restore shared signals start pid=%d tid=%ld comm=%s\n",
+			args->t->pid, sys_getpid(), args->comm);
 	ret = restore_signals(args->siginfo, args->siginfo_n, true);
 	if (ret)
 		goto core_restore_end;
+	if (args->tfork_active)
+		pr_debug("tfork: leader restore shared signals done pid=%d tid=%ld comm=%s\n",
+			args->t->pid, sys_getpid(), args->comm);
 
+	if (args->tfork_active)
+		pr_debug("tfork: leader restore private signals start pid=%d tid=%ld comm=%s\n",
+			args->t->pid, sys_getpid(), args->comm);
 	ret = restore_signals(args->t->siginfo, args->t->siginfo_n, false);
 	if (ret)
 		goto core_restore_end;
+	if (args->tfork_active)
+		pr_debug("tfork: leader restore private signals done pid=%d tid=%ld comm=%s\n",
+			args->t->pid, sys_getpid(), args->comm);
 
-	restore_finish_stage(task_entries_local, CR_STATE_RESTORE_SIGCHLD);
+	if (args->tfork_active)
+		pr_debug("tfork: leader sigchld stage complete pid=%d tid=%ld comm=%s threads=%d ns_level=%d\n",
+			args->t->pid, sys_getpid(), args->comm, args->nr_threads,
+			args->t->ns_level);
+	ret = restore_finish_stage(task_entries_local, CR_STATE_RESTORE_SIGCHLD);
+	if (args->tfork_active)
+		pr_debug("tfork: leader sigchld barrier returned pid=%d tid=%ld comm=%s stage=%ld\n",
+			args->t->pid, sys_getpid(), args->comm, ret);
 
 	rst_tcp_socks_all(args);
 

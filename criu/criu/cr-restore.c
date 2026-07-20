@@ -185,10 +185,39 @@ static int __restore_wait_inprogress_tasks(int participants)
 {
 	int ret;
 	futex_t *np = &task_entries->nr_in_progress;
+	const int tfork_restore_wait_timeout_ms = 10000;
+	const int tfork_restore_wait_poll_us = 100000;
 
-	futex_wait_while_gt(np, participants);
+	if (opts.tfork.active) {
+		int waited;
+
+		for (waited = 0; waited < tfork_restore_wait_timeout_ms;
+		     waited += tfork_restore_wait_poll_us / 1000) {
+			if ((int)futex_get(np) <= participants)
+				break;
+			usleep(tfork_restore_wait_poll_us);
+		}
+
+		if ((int)futex_get(np) > participants) {
+			pr_err("tfork restore wait timed out after %dms: participants=%d nr_in_progress=%d start_stage=%d task_cr_err=%d nr_tasks=%d nr_threads=%d nr_helpers=%d\n",
+			       tfork_restore_wait_timeout_ms,
+			       participants, (int)futex_get(np),
+			       (int)futex_get(&task_entries->start),
+			       get_task_cr_err(),
+			       task_entries->nr_tasks, task_entries->nr_threads,
+			       task_entries->nr_helpers);
+			set_cr_errno(ETIMEDOUT);
+			return -ETIMEDOUT;
+		}
+	} else {
+		futex_wait_while_gt(np, participants);
+	}
+
 	ret = (int)futex_get(np);
 	if (ret < 0) {
+		pr_err("restore wait aborted: participants=%d nr_in_progress=%d start_stage=%d task_cr_err=%d\n",
+		       participants, ret, (int)futex_get(&task_entries->start),
+		       get_task_cr_err());
 		set_cr_errno(get_task_cr_err());
 		return ret;
 	}
@@ -227,6 +256,17 @@ static inline void __restore_switch_stage(int next_stage)
 
 static int restore_switch_stage(int next_stage)
 {
+	if (opts.tfork.active)
+		pr_warn("tfork: restore_switch_stage %d participants=%d nr_tasks=%d nr_threads=%d nr_helpers=%d\n",
+			next_stage, stage_participants(next_stage),
+			task_entries->nr_tasks, task_entries->nr_threads,
+			task_entries->nr_helpers);
+	else
+		pr_info("restore_switch_stage %d participants=%d nr_tasks=%d nr_threads=%d nr_helpers=%d\n",
+			next_stage, stage_participants(next_stage),
+			task_entries->nr_tasks, task_entries->nr_threads,
+			task_entries->nr_helpers);
+
 	__restore_switch_stage(next_stage);
 	return restore_wait_inprogress_tasks();
 }
@@ -1395,6 +1435,16 @@ static inline int fork_with_pid(struct pstree_item *item)
 
 	ca.item = item;
 	ca.clone_flags = rsti(item)->clone_flags;
+	if (opts.tfork.active && item != root_item &&
+	    !(ca.clone_flags & CLONE_NEWPID) &&
+	    item->pid->ns_level > 1 &&
+	    item->pid->ns[0].ns_pid == INIT_PID) {
+		pr_info("tfork: repairing missing CLONE_NEWPID for pidns init uid=%d local=%d parent_local=%d level=%d\n",
+			uid(item), pid,
+			item->parent ? localpid(item->parent) : -1,
+			item->pid->ns_level);
+		ca.clone_flags |= CLONE_NEWPID;
+	}
 
 	BUG_ON(ca.clone_flags & CLONE_VM);
 
@@ -1434,13 +1484,45 @@ static inline int fork_with_pid(struct pstree_item *item)
 		strip |= CLONE_NEWUSER;
 
 	if (kdat.has_clone3_set_tid) {
-		if (item->pid->ns_level == 1)
+		if (opts.tfork.active && (ca.clone_flags & CLONE_NEWPID)) {
+			pr_info("tfork: restore pidns init uid=%d local pid %d with fresh parent pid, dumped chain level=%d\n",
+				uid(item), pid, item->pid->ns_level);
 			ret = clone3_with_pid_noasan(restore_task_with_children, &ca,
 						     ca.clone_flags & ~strip, SIGCHLD, pid);
-		else
+		} else if (item->pid->ns_level == 1)
+			ret = clone3_with_pid_noasan(restore_task_with_children, &ca,
+						     ca.clone_flags & ~strip, SIGCHLD, pid);
+		else {
+			struct pid tfork_pid = {};
+			struct pid *restore_pid = item->pid;
+
+			if (opts.tfork.active && (root_ns_mask & CLONE_NEWPID) &&
+			    root_item && root_item->pid->ns_level > 1 &&
+			    item->pid->ns_level > 1) {
+				/*
+				 * Copy only scalar pid identity. struct pid also
+				 * embeds rb_node links owned by the dumped pid trees;
+				 * copying those nodes into a temporary stack object
+				 * corrupts the tree metadata if it ever gets reused.
+				 */
+				tfork_pid.item = item->pid->item;
+				tfork_pid.real = item->pid->real;
+				tfork_pid.local = item->pid->local;
+				tfork_pid.uid = item->pid->uid;
+				tfork_pid.state = item->pid->state;
+				tfork_pid.stop_signo = item->pid->stop_signo;
+				tfork_pid.ns_level = item->pid->ns_level - 1;
+				tfork_pid.leaf_ns_id = item->pid->leaf_ns_id;
+				memcpy(tfork_pid.ns, item->pid->ns, sizeof(tfork_pid.ns));
+				restore_pid = &tfork_pid;
+				pr_info("tfork: restore pid uid=%d local=%d with rebased pid chain level %d -> %d\n",
+					uid(item), pid, item->pid->ns_level,
+					restore_pid->ns_level);
+			}
 			ret = clone3_with_nested_pid_noasan(restore_task_with_children, &ca,
 							    ca.clone_flags & ~strip,
-							    SIGCHLD, item->pid);
+							    SIGCHLD, restore_pid);
+		}
 	} else {
 		BUG_ON(item->pid->ns_level >= 1);
 		close_pid_proc();
@@ -1448,13 +1530,26 @@ static inline int fork_with_pid(struct pstree_item *item)
 				   (ca.clone_flags & ~strip) | SIGCHLD, &ca);
 	}
 	if (ret < 0) {
+		pr_err("fork_with_pid failed item uid=%d local=%d real=%d parent_local=%d flags=0x%lx stripped_flags=0x%lx ns_level=%d root_ns_mask=0x%lx tfork=%d\n",
+		       uid(item), pid, realpid(item),
+		       item->parent ? localpid(item->parent) : -1,
+		       ca.clone_flags, ca.clone_flags & ~strip,
+		       item->pid->ns_level, root_ns_mask,
+		       opts.tfork.active ? 1 : 0);
+		if (item->pid->ns_level > 0)
+			pr_err("fork_with_pid pid chain uid=%d ns=%d/%d/%d/%d\n",
+			       uid(item),
+			       item->pid->ns[0].ns_pid,
+			       item->pid->ns_level > 1 ? item->pid->ns[1].ns_pid : -1,
+			       item->pid->ns_level > 2 ? item->pid->ns[2].ns_pid : -1,
+			       item->pid->ns_level > 3 ? item->pid->ns[3].ns_pid : -1);
 		pr_perror("Can't fork for %d", pid);
 		if (errno == EEXIST)
 			set_cr_errno(EEXIST);
 		goto err_unlock;
 	}
 
-	if (item == root_item) {
+	if (opts.tfork.active || item == root_item) {
 		item->pid->real = ret;
 		pr_debug("PID: real %d virt %d\n", item->pid->real, localpid(item));
 	}
@@ -4045,6 +4140,7 @@ static int sigreturn_restore(struct task_restore_args *task_args, unsigned long 
 	task_args->vdso_rt_size = vdso_rt_size;
 	task_args->can_map_vdso = kdat.can_map_vdso;
 	task_args->has_clone3_set_tid = kdat.has_clone3_set_tid;
+	task_args->tfork_active = opts.tfork.active;
 
 	new_sp = restorer_stack(task_args->t->mz);
 
