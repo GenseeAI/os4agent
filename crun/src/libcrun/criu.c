@@ -46,6 +46,8 @@
 #  define DESCRIPTORS_FILENAME "descriptors.json"
 #  define CRIU_RUNC_CONFIG_FILE "/etc/criu/runc.conf"
 #  define CRIU_CRUN_CONFIG_FILE "/etc/criu/crun.conf"
+#  define CRIU_LOG_TAIL_LINES 80
+#  define CRIU_LOG_LINE_SIZE 1024
 
 #  define CRIU_EXT_NETNS "extRootNetNS"
 #  define CRIU_EXT_PIDNS "extRootPidNS"
@@ -543,9 +545,9 @@ static void
 show_criu_log (const char *work_path, const char *log)
 {
   cleanup_free char *log_path = NULL;
+  cleanup_free char *tail = NULL;
   libcrun_error_t *tmp_err = NULL;
-  char line[1024];
-  char tail[200][1024];
+  char line[CRIU_LOG_LINE_SIZE];
   size_t tail_index = 0;
   size_t tail_count = 0;
   FILE *f;
@@ -566,15 +568,23 @@ show_criu_log (const char *work_path, const char *log)
 
   /* Log with error verbosity as this is the default. */
   libcrun_error (0, "--- excerpt from CRIU log `%s`", log_path);
+  tail = calloc (CRIU_LOG_TAIL_LINES, CRIU_LOG_LINE_SIZE);
+  if (tail == NULL)
+    {
+      fclose (f);
+      return;
+    }
+
   while (fgets (line, sizeof (line), f) != NULL)
     {
-      strncpy (tail[tail_index], line, sizeof (tail[tail_index]) - 1);
-      tail[tail_index][sizeof (tail[tail_index]) - 1] = '\0';
-      tail_index = (tail_index + 1) % 200;
-      if (tail_count < 200)
+      char *slot = tail + tail_index * CRIU_LOG_LINE_SIZE;
+      strncpy (slot, line, CRIU_LOG_LINE_SIZE - 1);
+      slot[CRIU_LOG_LINE_SIZE - 1] = '\0';
+      tail_index = (tail_index + 1) % CRIU_LOG_TAIL_LINES;
+      if (tail_count < CRIU_LOG_TAIL_LINES)
         tail_count++;
 
-      if (strstr (line, "Error ") != NULL || strstr (line, "Warn ") != NULL
+      if (strstr (line, "Error ") != NULL
           || strstr (line, "failed") != NULL || strstr (line, "FAILED") != NULL
           || strstr (line, "Unable") != NULL || strstr (line, "Can't") != NULL
           || strstr (line, "No such") != NULL)
@@ -586,11 +596,11 @@ show_criu_log (const char *work_path, const char *log)
 
   if (tail_count > 0)
     {
-      size_t start = (tail_count == 200) ? tail_index : 0;
+      size_t start = (tail_count == CRIU_LOG_TAIL_LINES) ? tail_index : 0;
       libcrun_error (0, "--- last %zu CRIU log lines", tail_count);
       for (size_t i = 0; i < tail_count; i++)
         {
-          char *entry = tail[(start + i) % 200];
+          char *entry = tail + ((start + i) % CRIU_LOG_TAIL_LINES) * CRIU_LOG_LINE_SIZE;
           entry[strcspn (entry, "\n")] = '\0';
           libcrun_error (0, "%s", entry);
         }
@@ -1381,9 +1391,14 @@ out:
 #  define CRIU_TFORK_MAX_COPY_LOGS 16
 
 static void
-show_criu_tfork_restore_copy_logs (const char *image_path)
+show_criu_tfork_restore_copy_logs (const char *image_path, int copy_count)
 {
-  for (int i = 0; i < CRIU_TFORK_MAX_COPY_LOGS; i++)
+  if (copy_count < 0)
+    copy_count = 0;
+  if (copy_count > CRIU_TFORK_MAX_COPY_LOGS)
+    copy_count = CRIU_TFORK_MAX_COPY_LOGS;
+
+  for (int i = 0; i < copy_count; i++)
     {
       char log[64];
       snprintf (log, sizeof (log), "%s.copy%d", CRIU_TFORK_RESTORE_LOG_FILE, i);
@@ -1850,7 +1865,7 @@ libcrun_container_tfork_linux_criu (libcrun_container_t *container, libcrun_chec
     {
       show_criu_log (cr_options->work_path, CRIU_TFORK_LOG_FILE);
       show_criu_log (cr_options->image_path, CRIU_TFORK_RESTORE_LOG_FILE);
-      show_criu_tfork_restore_copy_logs (cr_options->image_path);
+      show_criu_tfork_restore_copy_logs (cr_options->image_path, cr_options->tfork_copies);
       return crun_make_error (err, 0, "criu_tfork failed: %d", ret);
     }
 

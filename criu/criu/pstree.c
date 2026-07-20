@@ -912,6 +912,10 @@ static int read_one_pstree_item(PstreeEntry *e)
 	}
 	pi->pid->state = TASK_ALIVE;
 	pi->pid->uid = e->uid;
+	pi->nr_threads = e->n_threads;
+	pi->threads = xmalloc(e->n_threads * sizeof(struct pid));
+	if (!pi->threads)
+		goto err;
 
 	/* note: we don't fail if we have empty ids */
 	if (read_pstree_ids(pi) < 0)
@@ -951,11 +955,6 @@ static int read_one_pstree_item(PstreeEntry *e)
 		pi->parent = parent;
 		list_add(&pi->sibling, &parent->children);
 	}
-
-	pi->nr_threads = e->n_threads;
-	pi->threads = xmalloc(e->n_threads * sizeof(struct pid));
-	if (!pi->threads)
-		goto err;
 
 	for (i = 0; i < e->n_threads; i++) {
 		int insert_status;

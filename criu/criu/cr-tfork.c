@@ -1315,6 +1315,10 @@ int cr_tfork_tasks(pid_t pid)
 			argv_new[argc_new++] = pidfile_arg;
 		}
 		argv_new[argc_new++] = "--keep-pid-hierarchy";
+		if (argc_new >= argc_max) {
+			pr_err("tfork restore argv overflow: used=%d max=%d\n", argc_new, argc_max);
+			exit(1);
+		}
 		argv_new[argc_new] = NULL;
 
 		execv("/proc/self/exe", argv_new);

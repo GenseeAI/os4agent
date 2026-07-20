@@ -332,6 +332,13 @@ int main(int argc, char *argv[], char *envp[])
 		if (opts.tree_id)
 			pr_warn("Using -t with criu restore is obsoleted\n");
 
+		if (!opts.tfork.active && opts.tfork.copies >= 1) {
+			pr_err("--tfork-copies requires --tfork-restore "
+			       "(use 'criu tfork --tfork-copies=N', not "
+			       "'criu restore --tfork-copies=N')\n");
+			return 1;
+		}
+
 		if (opts.tfork.active && opts.tfork.copies >= 1) {
 			int n = opts.tfork.copies, i;
 			pid_t *children;
@@ -346,13 +353,6 @@ int main(int argc, char *argv[], char *envp[])
 			 * restore fails with EEXIST ("Can't fork for 1").
 			 */
 			const int ns_flags = CLONE_NEWNS;
-
-			if (!opts.tfork.active) {
-				pr_err("--tfork-copies requires --tfork-restore "
-				       "(use 'criu tfork --tfork-copies=N', not "
-				       "'criu restore --tfork-copies=N')\n");
-				return 1;
-			}
 
 			if (!opts.restore_detach) {
 				pr_err("--tfork-copies requires --restore-detached\n");
@@ -450,6 +450,11 @@ int main(int argc, char *argv[], char *envp[])
 					if (opts.tfork.snap_roots_n > 0)
 						opts.root = opts.tfork.snap_roots[i];
 
+					/*
+					 * The n-copy child only creates the per-copy mount namespace. PID
+					 * namespaces must be recreated by CRIU from the image, otherwise the
+					 * helper would occupy PID 1 before the restored root task.
+					 */
 					opts.keep_pid_hierarchy = 0;
 
 					if (tfork_load_ncopy_fabric(i)) {

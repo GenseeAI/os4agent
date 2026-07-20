@@ -361,11 +361,12 @@ crun_command_tfork (struct crun_global_arguments *global_args, int argc, char **
   cr_options.manage_cgroups_mode = -1;
   cr_options.tfork_copies = 0;
   /*
-   * Agent runtimes commonly keep Unix sockets connected to helpers outside the
-   * dumped process subtree (tmux/Codex hooks, host-control bridges, etc.).
-   * Without this CRIU rejects the dump before restore begins.
+   * External Unix stream sockets can make Codex/tmux stacks dumpable, but they
+   * may hide unsupported socket topology. Keep the default fail-loud and expose
+   * this as an explicit escape hatch for agent integrations.
    */
-  cr_options.ext_unix_sk = true;
+  if (getenv ("CRUN_TFORK_EXT_UNIX_SK") != NULL)
+    cr_options.ext_unix_sk = true;
   cr_options.leave_running = true;
 
   return crun_run_create_internal (global_args, argc, argv, container_tfork, get_options, &crun_context, &run_argp,

@@ -68,6 +68,10 @@ func (ic *ContainerEngine) containerCloneLive(ctx context.Context, opts entities
 	}
 	requestedCopies := copies
 	useSingleCopyConmon := requestedCopies == 1 && os.Getenv("PODMAN_TFORK_SINGLE_COPY_CONMON") == "1"
+	// PODMAN_TFORK_SINGLE_COPY_DIRECT is a debugging escape hatch that skips
+	// the n-copy restore helper for single-copy experiments. Production paths
+	// keep the n-copy helper even for copies=1 so attach/status handling is
+	// consistent with multi-copy forks.
 	useSingleCopyDirect := requestedCopies == 1 && os.Getenv("PODMAN_TFORK_SINGLE_COPY_DIRECT") == "1"
 	useNcopyRestore := copies > 1 || (requestedCopies == 1 && !useSingleCopyConmon && !useSingleCopyDirect)
 
@@ -597,7 +601,7 @@ func (ic *ContainerEngine) containerCloneLive(ctx context.Context, opts entities
 			return filepath.Join(imgDir, fmt.Sprintf("tfork.pid.copy%d", i))
 		}
 		statePath := fmt.Sprintf("/run/crun/%s/status", cloneIDs[0])
-		needState := !useNcopyRestore && copies == 1
+		needState := !useNcopyRestore
 		cloneReadyTimeout := tforkCloneReadyTimeoutFromEnv()
 		deadline := time.Now().Add(cloneReadyTimeout)
 		readyCopies := 0

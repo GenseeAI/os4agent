@@ -94,19 +94,19 @@ for mod in "${ACTIVE_MODULES[@]}"; do
 
     if lsmod | awk '{print $1}' | grep -qx "${mod}"; then
         echo "  -- ${mod}: already loaded, trying reload"
-        rmmod "${mod}" 2>/dev/null || true
+        if ! rmmod "${mod}"; then
+            echo "build.sh: failed to unload loaded module ${mod}; aborting to avoid stale module" >&2
+            exit 1
+        fi
         if lsmod | awk '{print $1}' | grep -qx "${mod}"; then
-            echo "  -- ${mod}: still loaded; keeping existing module"
-            continue
+            echo "build.sh: module ${mod} is still loaded after rmmod; aborting to avoid stale module" >&2
+            exit 1
         fi
     fi
 
     echo "  -- ${mod}: insmod"
     if ! insmod "${ko_path}"; then
-        if lsmod | awk '{print $1}' | grep -qx "${mod}"; then
-            echo "  -- ${mod}: insmod reported already loaded; keeping existing module"
-            continue
-        fi
+        echo "build.sh: failed to insert rebuilt module ${mod} from ${ko_path}" >&2
         exit 1
     fi
 done

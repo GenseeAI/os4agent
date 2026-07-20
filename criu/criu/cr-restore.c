@@ -185,22 +185,28 @@ static int __restore_wait_inprogress_tasks(int participants)
 {
 	int ret;
 	futex_t *np = &task_entries->nr_in_progress;
+	const int tfork_restore_wait_timeout_ms = 10000;
+	const int tfork_restore_wait_poll_us = 100000;
 
 	if (opts.tfork.active) {
 		int waited;
 
-		for (waited = 0; waited < 100; waited++) {
+		for (waited = 0; waited < tfork_restore_wait_timeout_ms;
+		     waited += tfork_restore_wait_poll_us / 1000) {
 			if ((int)futex_get(np) <= participants)
 				break;
-			usleep(100000);
+			usleep(tfork_restore_wait_poll_us);
 		}
 
 		if ((int)futex_get(np) > participants) {
-			pr_err("tfork restore wait timed out: participants=%d nr_in_progress=%d start_stage=%d nr_tasks=%d nr_threads=%d nr_helpers=%d\n",
+			pr_err("tfork restore wait timed out after %dms: participants=%d nr_in_progress=%d start_stage=%d task_cr_err=%d nr_tasks=%d nr_threads=%d nr_helpers=%d\n",
+			       tfork_restore_wait_timeout_ms,
 			       participants, (int)futex_get(np),
 			       (int)futex_get(&task_entries->start),
+			       get_task_cr_err(),
 			       task_entries->nr_tasks, task_entries->nr_threads,
 			       task_entries->nr_helpers);
+			set_cr_errno(ETIMEDOUT);
 			return -ETIMEDOUT;
 		}
 	} else {
@@ -1493,8 +1499,21 @@ static inline int fork_with_pid(struct pstree_item *item)
 			if (opts.tfork.active && (root_ns_mask & CLONE_NEWPID) &&
 			    root_item && root_item->pid->ns_level > 1 &&
 			    item->pid->ns_level > 1) {
-				tfork_pid = *item->pid;
-				tfork_pid.ns_level--;
+				/*
+				 * Copy only scalar pid identity. struct pid also
+				 * embeds rb_node links owned by the dumped pid trees;
+				 * copying those nodes into a temporary stack object
+				 * corrupts the tree metadata if it ever gets reused.
+				 */
+				tfork_pid.item = item->pid->item;
+				tfork_pid.real = item->pid->real;
+				tfork_pid.local = item->pid->local;
+				tfork_pid.uid = item->pid->uid;
+				tfork_pid.state = item->pid->state;
+				tfork_pid.stop_signo = item->pid->stop_signo;
+				tfork_pid.ns_level = item->pid->ns_level - 1;
+				tfork_pid.leaf_ns_id = item->pid->leaf_ns_id;
+				memcpy(tfork_pid.ns, item->pid->ns, sizeof(tfork_pid.ns));
 				restore_pid = &tfork_pid;
 				pr_info("tfork: restore pid uid=%d local=%d with rebased pid chain level %d -> %d\n",
 					uid(item), pid, item->pid->ns_level,
