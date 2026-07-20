@@ -742,7 +742,8 @@ err:
 static void pstree_remove_pid_if_linked(struct pid *pid_node)
 {
 	struct pid *found;
-	bool valid_leaf_ns = pid_node->leaf_ns_id >= 0 && pid_node->leaf_ns_id <= max_ns_id;
+	bool valid_leaf_ns = pid_node->leaf_ns_id >= 0 &&
+			     (unsigned int)pid_node->leaf_ns_id < pid_namespace_count;
 
 	if (pid_node->uid > 0) {
 		found = __lookup_pid_uid(&uid_root_rb, pid_node->uid, NULL, NULL);
@@ -1013,7 +1014,7 @@ static int read_one_pstree_item(PstreeEntry *e)
 		pi->threads[i].state = TASK_THREAD;
 		pi->threads[i].item = NULL;
 		if (i == 0) {
-
+			/* The leader is indexed through pi->pid, not this mirror. */
 			pi->pid->ns_level = pi->threads[0].ns_level;
 			pi->pid->local = pi->threads[0].ns[0].ns_pid;
 			memcpy(pi->pid->ns, pi->threads[0].ns, e->threads[0]->n_ns * sizeof(struct pid_ns));
@@ -1053,8 +1054,12 @@ err:
 			pi->threads = NULL;
 			pi->nr_threads = 0;
 		}
-		if (created_item)
-			xfree(pi);
+		/*
+		 * Restore pstree items come from the shared linear arena. The
+		 * item may no longer be the last allocation after read_pstree_ids(),
+		 * so it cannot be released individually. Restore teardown reclaims
+		 * the arena after this parse failure.
+		 */
 	}
 	return ret;
 }
