@@ -399,7 +399,7 @@ static int freezer_wait_processes(void)
 			pid = waitpid(-1, &status, opts.tfork.active ? WNOHANG : 0);
 			if (pid > 0)
 				break;
-			if (pid < 0 && errno == EINTR)
+			if (opts.tfork.active && pid < 0 && errno == EINTR)
 				continue;
 			if (!opts.tfork.active || (pid < 0 && errno != ECHILD && errno != EINTR)) {
 				pr_perror("Unable to wait processes");

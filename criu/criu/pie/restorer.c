@@ -2498,6 +2498,11 @@ tfork_skip_page_restore:
 					 * tfork currently restores non-leader threads with fresh TIDs.
 					 * Reusing dumped TIDs collides with the synthetic per-copy restore
 					 * helper in nested PID namespaces; process IDs remain restored exactly.
+					 *
+					 * This can leave userspace thread-ID caches stale in the clone:
+					 * robust/errorcheck mutex owner futex words, cached gettid values
+					 * in TLS/TCB, and pthread_join targets derived from old pthread_t
+					 * values may not describe the clone's fresh worker TIDs.
 					 */
 					pr_debug("tfork: restore thread pid=%d with fresh tid, set_tid_size %d -> 0 tids=%d/%d\n",
 						thread_args[i].pid,

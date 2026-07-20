@@ -732,11 +732,35 @@ static int __pstree_insert_pid(struct pid *pid_node, struct rb_node *root_parent
 			rb_link_and_balance(&uid_root_rb, &pid_node->uid_node, parent, link);
 	}
 
-    return 0;
+	return 0;
 
 err:
-    rb_erase(&pid_node->root_ns_node, &pid_root_rb[ALL_PID_NS_ID]);
-    return -1;
+	rb_erase(&pid_node->root_ns_node, &pid_root_rb[ALL_PID_NS_ID]);
+	return -1;
+}
+
+static void pstree_remove_pid_if_linked(struct pid *pid_node)
+{
+	struct pid *found;
+
+	if (pid_node->uid > 0) {
+		found = __lookup_pid_uid(&uid_root_rb, pid_node->uid, NULL, NULL);
+		if (found == pid_node)
+			rb_erase(&pid_node->uid_node, &uid_root_rb);
+	}
+
+	if (pid_node->leaf_ns_id != ALL_PID_NS_ID) {
+		found = __lookup_pid_leaf(&pid_root_rb[pid_node->leaf_ns_id],
+					  pid_node->local, NULL, NULL);
+		if (found == pid_node)
+			rb_erase(&pid_node->leaf_ns_node,
+				 &pid_root_rb[pid_node->leaf_ns_id]);
+	}
+
+	found = __lookup_pid_root(&pid_root_rb[ALL_PID_NS_ID],
+				  pid_node->real, NULL, NULL);
+	if (found == pid_node)
+		rb_erase(&pid_node->root_ns_node, &pid_root_rb[ALL_PID_NS_ID]);
 }
 
 int pstree_insert_pid(struct pid *pid_node)
@@ -873,8 +897,9 @@ static int read_pstree_ids(struct pstree_item *pi)
  */
 static int read_one_pstree_item(PstreeEntry *e)
 {
-	struct pstree_item *pi;
-	int ret = -1, i, j;
+	struct pstree_item *pi = NULL;
+	int ret = -1, i, j, inserted_threads = 0;
+	bool linked = false, pid_inserted = false, threads_allocated = false;
 
 	pi = get_or_create_pstree_item(e->realpid, e->localpid, e->nsid);
 	if (!pi)
@@ -916,6 +941,7 @@ static int read_one_pstree_item(PstreeEntry *e)
 	pi->threads = xmalloc(e->n_threads * sizeof(struct pid));
 	if (!pi->threads)
 		goto err;
+	threads_allocated = true;
 
 	/* note: we don't fail if we have empty ids */
 	if (read_pstree_ids(pi) < 0)
@@ -931,6 +957,7 @@ static int read_one_pstree_item(PstreeEntry *e)
 
 	if (__pstree_insert_pid(pi->pid, NULL, NULL) < 0)
 		goto err;
+	pid_inserted = true;
 
 	if (e->ppid == 0) {
 		if (root_item) {
@@ -954,6 +981,7 @@ static int read_one_pstree_item(PstreeEntry *e)
 		parent = pid->item;
 		pi->parent = parent;
 		list_add(&pi->sibling, &parent->children);
+		linked = true;
 	}
 
 	for (i = 0; i < e->n_threads; i++) {
@@ -983,6 +1011,7 @@ static int read_one_pstree_item(PstreeEntry *e)
 			pr_err("Unexpected task %d in a tree %d\n", e->threads[i]->ns[0]->nspid, i);
 			goto err;
 		}
+		inserted_threads++;
 	}
 
 	task_entries->nr_threads += e->n_threads;
@@ -990,6 +1019,21 @@ static int read_one_pstree_item(PstreeEntry *e)
 
 	ret = 1;
 err:
+	if (ret < 0) {
+		for (i = 1; i <= inserted_threads; i++)
+			pstree_remove_pid_if_linked(&pi->threads[i]);
+		if (root_item == pi)
+			root_item = NULL;
+		if (linked)
+			list_del_init(&pi->sibling);
+		if (pid_inserted)
+			pstree_remove_pid_if_linked(pi->pid);
+		if (threads_allocated) {
+			xfree(pi->threads);
+			pi->threads = NULL;
+			pi->nr_threads = 0;
+		}
+	}
 	return ret;
 }
 
