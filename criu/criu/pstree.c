@@ -742,6 +742,7 @@ err:
 static void pstree_remove_pid_if_linked(struct pid *pid_node)
 {
 	struct pid *found;
+	bool valid_leaf_ns = pid_node->leaf_ns_id >= 0 && pid_node->leaf_ns_id <= max_ns_id;
 
 	if (pid_node->uid > 0) {
 		found = __lookup_pid_uid(&uid_root_rb, pid_node->uid, NULL, NULL);
@@ -749,7 +750,7 @@ static void pstree_remove_pid_if_linked(struct pid *pid_node)
 			rb_erase(&pid_node->uid_node, &uid_root_rb);
 	}
 
-	if (pid_node->leaf_ns_id != ALL_PID_NS_ID) {
+	if (pid_node->leaf_ns_id != ALL_PID_NS_ID && valid_leaf_ns) {
 		found = __lookup_pid_leaf(&pid_root_rb[pid_node->leaf_ns_id],
 					  pid_node->local, NULL, NULL);
 		if (found == pid_node)
@@ -768,10 +769,12 @@ int pstree_insert_pid(struct pid *pid_node)
 	return __pstree_insert_pid(pid_node, NULL, NULL);
 }
 
-static struct pstree_item *get_or_create_pstree_item(pid_t real, pid_t local, int pidns_id)
+static struct pstree_item *get_or_create_pstree_item(pid_t real, pid_t local, int pidns_id, bool *created)
 {
     struct pid *found;
     struct pstree_item *item;
+
+    *created = false;
 
     found = __lookup_pid_root(&pid_root_rb[ALL_PID_NS_ID], real, NULL, NULL);
     if (found) {
@@ -788,6 +791,7 @@ static struct pstree_item *get_or_create_pstree_item(pid_t real, pid_t local, in
     item->pid->real = real;
     item->pid->local = local;
     item->pid->leaf_ns_id = pidns_id;
+    *created = true;
 
     return item;
 }
@@ -898,13 +902,23 @@ static int read_pstree_ids(struct pstree_item *pi)
 static int read_one_pstree_item(PstreeEntry *e)
 {
 	struct pstree_item *pi = NULL;
-	int ret = -1, i, j, inserted_threads = 0;
+	int ret = -1, i, j, next_inserted_thread = 1;
 	bool linked = false, pid_inserted = false, threads_allocated = false;
+	bool created_item = false;
 
-	pi = get_or_create_pstree_item(e->realpid, e->localpid, e->nsid);
+	pi = get_or_create_pstree_item(e->realpid, e->localpid, e->nsid, &created_item);
 	if (!pi)
 		goto err;
+	/*
+	 * get_or_create_pstree_item() can only reuse an item that is still
+	 * TASK_UNDEF. Completed items are rejected here, so the unwind below
+	 * cannot tear down a previously parsed pstree item.
+	 */
 	BUG_ON(pi->pid->state != TASK_UNDEF);
+	if (!created_item && (pi->threads || pi->nr_threads)) {
+		pr_err("Refusing to reuse partially populated pstree item for %d\n", e->realpid);
+		goto err;
+	}
 
 	/*
 	 * Populate the ns-chain on pi from the thread-leader entry before
@@ -1011,7 +1025,7 @@ static int read_one_pstree_item(PstreeEntry *e)
 			pr_err("Unexpected task %d in a tree %d\n", e->threads[i]->ns[0]->nspid, i);
 			goto err;
 		}
-		inserted_threads++;
+		next_inserted_thread = i + 1;
 	}
 
 	task_entries->nr_threads += e->n_threads;
@@ -1019,8 +1033,14 @@ static int read_one_pstree_item(PstreeEntry *e)
 
 	ret = 1;
 err:
-	if (ret < 0) {
-		for (i = 1; i <= inserted_threads; i++)
+	if (ret < 0 && pi) {
+		/*
+		 * threads[0] is the leader mirrored by pi->pid. Only
+		 * non-leader threads are inserted independently, and
+		 * next_inserted_thread always points one past the last
+		 * successfully inserted non-leader slot.
+		 */
+		for (i = 1; i < next_inserted_thread; i++)
 			pstree_remove_pid_if_linked(&pi->threads[i]);
 		if (root_item == pi)
 			root_item = NULL;
@@ -1033,6 +1053,8 @@ err:
 			pi->threads = NULL;
 			pi->nr_threads = 0;
 		}
+		if (created_item)
+			xfree(pi);
 	}
 	return ret;
 }

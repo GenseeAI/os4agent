@@ -1314,7 +1314,7 @@ int cr_tfork_tasks(pid_t pid)
 			argv_new[argc_new++] = "--pidfile";
 			argv_new[argc_new++] = pidfile_arg;
 		}
-		if (argc_new + 1 >= argv_max) {
+		if ((size_t)argc_new + 1 >= argv_max) {
 			pr_err("tfork restore argv overflow: used=%d max=%zu\n", argc_new, argv_max);
 			exit(1);
 		}
