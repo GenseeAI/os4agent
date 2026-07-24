@@ -106,8 +106,32 @@ GRAPHROOT="$(sudo podman info --format '{{.Store.GraphRoot}}')"
 findmnt -T "$GRAPHROOT"
 ```
 
-The reported driver and filesystem must both be `btrfs`. Step 6 verifies the
-same store through the newly built tclone wrapper.
+The reported driver and filesystem must both be `btrfs`. An `overlay` driver
+stored on a btrfs filesystem is still overlay storage, and tclone snapshots fail
+against it with errors such as `Not a Btrfs filesystem`.
+
+If you cannot change the host-wide rootful store, create a dedicated storage
+configuration and pass it to every tclone Podman and Gensee command:
+
+```bash
+export GENSEE_HOME="${GENSEE_HOME:-$HOME/.gensee}"
+export CONTAINERS_STORAGE_CONF="$GENSEE_HOME/tclone-btrfs-storage.conf"
+mkdir -p "$GENSEE_HOME" /mnt/btrfs/tclone-root /mnt/btrfs/tclone-run
+
+cat >"$CONTAINERS_STORAGE_CONF" <<'EOF'
+[storage]
+driver = "btrfs"
+runroot = "/mnt/btrfs/tclone-run"
+graphroot = "/mnt/btrfs/tclone-root"
+EOF
+
+sudo env "CONTAINERS_STORAGE_CONF=$CONTAINERS_STORAGE_CONF" \
+  podman info --format '{{.Store.GraphRoot}} {{.Store.GraphDriverName}}'
+```
+
+Images are scoped to the selected store. If `CONTAINERS_STORAGE_CONF` is set
+when Gensee runs, use the same value when pulling or building the image. Step 6
+verifies the same store through the newly built tclone wrapper.
 
 ## 4. Build and boot the tclone kernel
 
@@ -166,6 +190,16 @@ sudo ./podman/build.sh
 Stop existing tclone containers before rebuilding CRIU. The build fails closed
 if an old module is still in use and cannot be unloaded.
 
+If `insmod` reports `Invalid module format`, the modules were built for a
+different kernel than the one currently running. Reboot into the
+`-pgcachecow` kernel, verify `uname -r`, then rerun `sudo ./criu/build.sh`.
+You can inspect the expected kernel release with:
+
+```bash
+modinfo criu/kernel_module/vma_cherrypick/vma_cherrypick.ko | grep vermagic
+uname -r
+```
+
 Always invoke Podman through [`podman-tfork.sh`](podman-tfork.sh). The wrapper
 selects the matching in-tree binaries, sets `LD_LIBRARY_PATH`, uses
 `cgroup_manager = "cgroupfs"`, and preserves the rootful Podman store expected
@@ -176,7 +210,8 @@ by Gensee.
 Check the runtime wiring:
 
 ```bash
-sudo ./podman-tfork.sh info |
+sudo env "CONTAINERS_STORAGE_CONF=$CONTAINERS_STORAGE_CONF" \
+  ./podman-tfork.sh info |
   grep -A2 -E 'conmon:|ociRuntime:|cgroupManager:|graphStatus:|graphRoot:|kernel:|logDriver:'
 ```
 
@@ -193,12 +228,14 @@ Verify the individual tfork pieces:
 
 ```bash
 lsmod | grep -E 'vma_cherrypick|criu_capbypass|pkey_state|reparent_task'
+ls -l /dev/vma_cherrypick /dev/criu_capbypass /dev/reparent /dev/pkey_state
 
 LD_LIBRARY_PATH="$PWD/criu/lib/c" \
   ./crun/crun --help | grep tfork
 
 ./conmon/bin/conmon --help 2>&1 | grep -- --tfork
-sudo ./podman-tfork.sh container clone --help | grep -- --live
+sudo env "CONTAINERS_STORAGE_CONF=$CONTAINERS_STORAGE_CONF" \
+  ./podman-tfork.sh container clone --help | grep -- --live
 cat /proc/filecow_stats
 ```
 
@@ -211,15 +248,18 @@ ordinary rootless Podman puts it in a different image store and Gensee will not
 find it.
 
 ```bash
-sudo ./podman-tfork.sh pull ghcr.io/wuklab/webtop:ubuntu-kde
-sudo ./podman-tfork.sh image inspect \
+sudo env "CONTAINERS_STORAGE_CONF=$CONTAINERS_STORAGE_CONF" \
+  ./podman-tfork.sh pull ghcr.io/wuklab/webtop:ubuntu-kde
+sudo env "CONTAINERS_STORAGE_CONF=$CONTAINERS_STORAGE_CONF" \
+  ./podman-tfork.sh image inspect \
   ghcr.io/wuklab/webtop:ubuntu-kde >/dev/null
 ```
 
 To build the image locally instead:
 
 ```bash
-sudo ./podman-tfork.sh build \
+sudo env "CONTAINERS_STORAGE_CONF=$CONTAINERS_STORAGE_CONF" \
+  ./podman-tfork.sh build \
   -t gensee-tclone-webtop:tmux \
   ./ubuntu-img
 ```
@@ -272,6 +312,10 @@ export GENSEE_HOME="${GENSEE_HOME:-$HOME/.gensee}"
 export GENSEE_TCLONE_PODMAN="$HOME/os4agent/podman-tfork.sh"
 export GENSEE_TCLONE_IMAGE="ghcr.io/wuklab/webtop:ubuntu-kde"
 export GENSEE_TCLONE_READY_TIMEOUT_SECS=120
+export GENSEE_TMP_ROOT="${GENSEE_TMP_ROOT:-/tmp}"
+export TMPDIR="$GENSEE_TMP_ROOT"
+# Include this only if you created the dedicated storage config in step 3.
+# export CONTAINERS_STORAGE_CONF="$GENSEE_HOME/tclone-btrfs-storage.conf"
 ```
 
 If Node and the agent CLI come from NVM, also export:
@@ -281,8 +325,20 @@ export GENSEE_TCLONE_NODE_ROOT="$HOME/.nvm"
 export GENSEE_TCLONE_NODE_BIN="$(dirname "$(command -v node)")"
 ```
 
+Keep `GENSEE_TMP_ROOT` outside the workspace you will run agents in. If Gensee
+stages inside the workspace, later launches can recursively copy the
+`gensee-agent-guard` staging tree and fail with `File name too long`.
+
+Use the same sudo-preserving wrapper for every Gensee tclone command:
+
+```bash
+alias gensee-tclone='sudo env "PATH=$PATH" "HOME=$HOME" "TERM=$TERM" "TMUX=$TMUX" "TMPDIR=$TMPDIR" "GENSEE_TMP_ROOT=$GENSEE_TMP_ROOT" "CONTAINERS_STORAGE_CONF=$CONTAINERS_STORAGE_CONF" "GENSEE_HOME=$GENSEE_HOME" "GENSEE_TCLONE_PODMAN=$GENSEE_TCLONE_PODMAN" "GENSEE_TCLONE_IMAGE=$GENSEE_TCLONE_IMAGE" "GENSEE_TCLONE_READY_TIMEOUT_SECS=$GENSEE_TCLONE_READY_TIMEOUT_SECS" gensee'
+```
+
 Gensee copies or mounts the detected host agent configuration into the source
-container. The image must contain `tmux`; the default image does.
+container. The image must contain `tmux`; the default image does. If you rebuild
+or reinstall Gensee, stop the old source and launch a fresh source so the
+host-control process uses the new binary.
 
 ## 10. Launch Codex through Gensee
 
@@ -305,6 +361,9 @@ sudo env \
   "HOME=$HOME" \
   "TERM=$TERM" \
   "TMUX=$TMUX" \
+  "TMPDIR=$TMPDIR" \
+  "GENSEE_TMP_ROOT=$GENSEE_TMP_ROOT" \
+  "CONTAINERS_STORAGE_CONF=$CONTAINERS_STORAGE_CONF" \
   "GENSEE_HOME=$GENSEE_HOME" \
   "GENSEE_TCLONE_PODMAN=$GENSEE_TCLONE_PODMAN" \
   "GENSEE_TCLONE_IMAGE=$GENSEE_TCLONE_IMAGE" \
@@ -324,6 +383,13 @@ container. Normal Gensee/Codex operation is chat-driven: Codex asks before
 creating a fork, Gensee opens the fork pane, the work continues in the fork,
 and Codex summarizes the result before offering merge, promote, or discard.
 Users should not type Gensee lifecycle commands manually.
+
+You can use the wrapper form instead:
+
+```bash
+cd /path/to/your/project
+gensee-tclone run --runtime tclone -- codex
+```
 
 ## 11. Smoke-test the mediated fork workflow
 
@@ -356,7 +422,8 @@ Pull through the same rootful wrapper Gensee uses and use the fully qualified
 image name:
 
 ```bash
-sudo "$GENSEE_TCLONE_PODMAN" pull \
+sudo env "CONTAINERS_STORAGE_CONF=$CONTAINERS_STORAGE_CONF" \
+  "$GENSEE_TCLONE_PODMAN" pull \
   ghcr.io/wuklab/webtop:ubuntu-kde
 export GENSEE_TCLONE_IMAGE=ghcr.io/wuklab/webtop:ubuntu-kde
 ```
@@ -364,8 +431,33 @@ export GENSEE_TCLONE_IMAGE=ghcr.io/wuklab/webtop:ubuntu-kde
 ### Gensee reports that a container is missing
 
 Use the same `sudo`, `GENSEE_HOME`, and `GENSEE_TCLONE_PODMAN` values for every
-Gensee tclone invocation. Rootless Podman and the rootful wrapper use different
-stores.
+Gensee tclone invocation. Rootless Podman, rootful Podman without
+`CONTAINERS_STORAGE_CONF`, and rootful Podman with `CONTAINERS_STORAGE_CONF`
+can all use different stores.
+
+### Fork appears in `gensee run list` but no tmux pane opens
+
+The attach pane re-enters `gensee run attach`, so it needs the same
+`GENSEE_HOME`, `GENSEE_TMP_ROOT`, `TMPDIR`, `CONTAINERS_STORAGE_CONF`, and
+`GENSEE_TCLONE_PODMAN` environment as the original launch. Use the
+`gensee-tclone` alias above for `run`, `list`, `fork`, `attach`, `send`,
+`exec`, `merge`, `switch`, and cleanup.
+
+If this happens after rebuilding Gensee, launch a fresh source. Already-running
+sources keep their old host-control process in memory.
+
+### `File name too long` during launch
+
+Set `GENSEE_TMP_ROOT` and `TMPDIR` to a directory outside the workspace, then
+launch again. If a previous failed launch left a staging tree inside the
+workspace, remove that generated `gensee-agent-guard` directory before retrying.
+
+### Kernel modules fail with `Invalid module format`
+
+The `.ko` files were built for a different kernel release than the booted
+kernel. Reboot into the `-pgcachecow` kernel, run `uname -r`, rebuild with
+`sudo ./criu/build.sh`, and verify that `/dev/vma_cherrypick`,
+`/dev/criu_capbypass`, `/dev/reparent`, and `/dev/pkey_state` exist.
 
 ### Clone readiness times out
 
