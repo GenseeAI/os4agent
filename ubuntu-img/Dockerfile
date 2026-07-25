@@ -119,6 +119,7 @@ RUN \
     libreoffice-style-breeze \
     libreoffice-writer \
     thunderbird \
+    tmux \
     ubuntu-wallpapers \
     ubuntu-wallpapers-jammy \
     vlc && \

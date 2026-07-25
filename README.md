@@ -243,30 +243,25 @@ Do not continue to Gensee until these checks pass.
 
 ## 7. Prepare the Gensee container image
 
-Pull the default image through the rootful tclone wrapper. Pulling it with
-ordinary rootless Podman puts it in a different image store and Gensee will not
-find it.
-
-```bash
-sudo env "CONTAINERS_STORAGE_CONF=$CONTAINERS_STORAGE_CONF" \
-  ./podman-tfork.sh pull ghcr.io/wuklab/webtop:ubuntu-kde
-sudo env "CONTAINERS_STORAGE_CONF=$CONTAINERS_STORAGE_CONF" \
-  ./podman-tfork.sh image inspect \
-  ghcr.io/wuklab/webtop:ubuntu-kde >/dev/null
-```
-
-To build the image locally instead:
+Build the Gensee image locally through the rootful tclone wrapper. The upstream
+webtop images do not include all packages Gensee's tclone workflow expects,
+including `tmux`, so do not use them directly.
 
 ```bash
 sudo env "CONTAINERS_STORAGE_CONF=$CONTAINERS_STORAGE_CONF" \
   ./podman-tfork.sh build \
-  -t gensee-tclone-webtop:tmux \
+  -t localhost/gensee-tclone-webtop:tmux \
   ./ubuntu-img
+
+sudo env "CONTAINERS_STORAGE_CONF=$CONTAINERS_STORAGE_CONF" \
+  ./podman-tfork.sh image inspect \
+  localhost/gensee-tclone-webtop:tmux >/dev/null
 ```
 
-If you build locally, set `GENSEE_TCLONE_IMAGE` to
-`gensee-tclone-webtop:tmux`. Otherwise, use the fully qualified GHCR name to
-avoid Podman's short-name resolution error.
+Use the fully qualified local image name
+`localhost/gensee-tclone-webtop:tmux` for `GENSEE_TCLONE_IMAGE`. Building or
+pulling with ordinary rootless Podman puts the image in a different image store
+and Gensee will not find it.
 
 Gensee creates and live-clones the source container itself. There is no manual
 source-container or Podman clone step.
@@ -310,7 +305,7 @@ Add these exports to the host shell profile:
 ```bash
 export GENSEE_HOME="${GENSEE_HOME:-$HOME/.gensee}"
 export GENSEE_TCLONE_PODMAN="$HOME/os4agent/podman-tfork.sh"
-export GENSEE_TCLONE_IMAGE="ghcr.io/wuklab/webtop:ubuntu-kde"
+export GENSEE_TCLONE_IMAGE="localhost/gensee-tclone-webtop:tmux"
 export GENSEE_TCLONE_READY_TIMEOUT_SECS=120
 export GENSEE_TMP_ROOT="${GENSEE_TMP_ROOT:-/tmp}"
 export TMPDIR="$GENSEE_TMP_ROOT"
@@ -336,9 +331,9 @@ alias gensee-tclone='sudo env "PATH=$PATH" "HOME=$HOME" "TERM=$TERM" "TMUX=$TMUX
 ```
 
 Gensee copies or mounts the detected host agent configuration into the source
-container. The image must contain `tmux`; the default image does. If you rebuild
-or reinstall Gensee, stop the old source and launch a fresh source so the
-host-control process uses the new binary.
+container. The image must contain `tmux`; the local image built in step 7 does.
+If you rebuild or reinstall Gensee, stop the old source and launch a fresh
+source so the host-control process uses the new binary.
 
 ## 10. Launch Codex through Gensee
 
@@ -418,14 +413,15 @@ returns the comparison and group-level lifecycle choice to the source Codex.
 
 ### Image not found or short-name resolution failed
 
-Pull through the same rootful wrapper Gensee uses and use the fully qualified
-image name:
+Build through the same rootful wrapper Gensee uses and use the fully qualified
+local image name:
 
 ```bash
 sudo env "CONTAINERS_STORAGE_CONF=$CONTAINERS_STORAGE_CONF" \
-  "$GENSEE_TCLONE_PODMAN" pull \
-  ghcr.io/wuklab/webtop:ubuntu-kde
-export GENSEE_TCLONE_IMAGE=ghcr.io/wuklab/webtop:ubuntu-kde
+  "$GENSEE_TCLONE_PODMAN" build \
+  -t localhost/gensee-tclone-webtop:tmux \
+  "$HOME/os4agent/ubuntu-img"
+export GENSEE_TCLONE_IMAGE=localhost/gensee-tclone-webtop:tmux
 ```
 
 ### Gensee reports that a container is missing
