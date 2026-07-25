@@ -9,6 +9,7 @@ version="7.0.1"
 # Append a suffix
 LocalVersion="-pgcachecow"
 num_cores=$(($(nproc --all) - 2))
+num_cores=$(( num_cores > 1 ? num_cores : 1 ))
 
 ## Functions
 delete_old_kernel_contents () {

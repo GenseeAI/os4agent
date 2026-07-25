@@ -1,6 +1,6 @@
 services:
   webtop:
-    image: ${IMAGE:-ghcr.io/wuklab/webtop:ubuntu-kde}
+    image: ${IMAGE:-localhost/gensee-tclone-webtop:tmux}
     container_name: webtop
     security_opt:
       - seccomp=unconfined
