@@ -3,18 +3,28 @@
 #include <assert.h>
 
 #include "log.h"
+#include "pstree.h"
 #include "util.h"
 #include "criu-log.h"
 
 int parse_statement(int i, char *line, char **configuration);
 
+atomic_t pid_uid_generator = ATOMIC_INIT(0);
+
 int main(int argc, char *argv[], char *envp[])
 {
 	char **configuration;
+	struct pid first_pid = {};
+	struct pid second_pid = {};
 	int i;
 
 	configuration = malloc(10 * sizeof(char *));
 	log_init(NULL);
+
+	pid_assign_uid(&first_pid);
+	pid_assign_uid(&second_pid);
+	assert(first_pid.uid > 0);
+	assert(second_pid.uid > first_pid.uid);
 
 	i = parse_statement(0, "", configuration);
 	assert(i == 0);

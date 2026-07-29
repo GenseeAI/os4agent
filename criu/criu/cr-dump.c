@@ -887,6 +887,7 @@ static int collect_pstree_ids_predump(void)
 
 	crt.i.pid->state = TASK_ALIVE;
 	crt.i.pid->real = getpid();
+	pid_assign_uid(crt.i.pid);
 
 	if (predump_task_ns_ids(&crt.i))
 		return -1;

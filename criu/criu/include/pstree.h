@@ -20,6 +20,11 @@ extern atomic_t pid_uid_generator;
 
 #define HELPER_UID_BASE (0x40000000)
 
+static inline void pid_assign_uid(struct pid *pid)
+{
+	pid->uid = atomic_inc_return(&pid_uid_generator);
+}
+
 struct pstree_item {
 	struct pstree_item *parent;
 	struct list_head children; /* list of my children */
