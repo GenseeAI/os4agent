@@ -4,7 +4,9 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io/fs"
 	"net"
 	"os"
 	"os/exec"
@@ -1993,16 +1995,38 @@ func tforkSetupOverlayRootfsFromParent(snapRO, parentUpperFrozen, bundleDir stri
 }
 
 func tforkPurgeSockets(rootfs string) error {
-	cmd := exec.Command("find", rootfs, "-mindepth", "1", "-type", "s", "-print", "-delete")
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("find -type s -delete %s: %s: %w", rootfs, strings.TrimSpace(string(out)), err)
+	var errs []error
+	removed := 0
+	walkErr := filepath.WalkDir(rootfs, func(path string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			errs = append(errs, fmt.Errorf("walk %s: %w", path, walkErr))
+			return nil
+		}
+		if path == rootfs {
+			return nil
+		}
+		info, err := entry.Info()
+		if err != nil {
+			errs = append(errs, fmt.Errorf("stat %s: %w", path, err))
+			return nil
+		}
+		if info.Mode()&os.ModeSocket == 0 {
+			return nil
+		}
+		if err := os.Remove(path); err != nil {
+			errs = append(errs, fmt.Errorf("remove socket %s: %w", path, err))
+			return nil
+		}
+		removed++
+		return nil
+	})
+	if walkErr != nil {
+		errs = append(errs, fmt.Errorf("walk %s: %w", rootfs, walkErr))
 	}
-	if len(out) > 0 {
-		n := strings.Count(string(out), "\n")
-		logrus.Infof("tfork: purged %d unix socket(s) from %s", n, rootfs)
+	if removed > 0 {
+		logrus.Infof("tfork: purged %d unix socket(s) from %s", removed, rootfs)
 	}
-	return nil
+	return errors.Join(errs...)
 }
 
 func tforkBuildSkipMnts(srcPID int) []string {
