@@ -374,9 +374,9 @@ int prepare_inventory(InventoryEntry *he)
 	he->has_lsmtype = true;
 	he->lsmtype = host_lsm_type();
 
+	pid_init_dump(crt.i.pid, &crt.i);
 	crt.i.pid->state = TASK_ALIVE;
 	crt.i.pid->real = getpid();
-	pid_assign_uid(crt.i.pid);
 	if (get_task_ids(&crt.i))
 		return -1;
 

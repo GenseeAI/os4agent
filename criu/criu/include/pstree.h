@@ -20,9 +20,21 @@ extern atomic_t pid_uid_generator;
 
 #define HELPER_UID_BASE (0x40000000)
 
-static inline void pid_assign_uid(struct pid *pid)
+static inline void pid_init_dump(struct pid *pid, struct pstree_item *item)
 {
-	pid->uid = atomic_inc_return(&pid_uid_generator);
+	*pid = (struct pid){
+		.item = item,
+		.real = -1,
+		.local = -1,
+		.uid = atomic_inc_return(&pid_uid_generator),
+		.state = TASK_UNDEF,
+		.stop_signo = -1,
+		.ns_level = -1,
+		.leaf_ns_id = ALL_PID_NS_ID,
+	};
+	rb_init_node(&pid->leaf_ns_node);
+	rb_init_node(&pid->root_ns_node);
+	rb_init_node(&pid->uid_node);
 }
 
 struct pstree_item {
