@@ -272,26 +272,26 @@ struct pstree_item *__alloc_pstree_item(bool rst)
 	INIT_LIST_HEAD(&item->children);
 	INIT_LIST_HEAD(&item->sibling);
 
-	item->pid->ns_level = -1;
-	item->pid->leaf_ns_id = ALL_PID_NS_ID;
-	item->pid->real = -1;
-	item->pid->local = -1;
-
 	if (!rst)
-		item->pid->uid = atomic_inc_return(&pid_uid_generator);
-	else
+		pid_init_dump(item->pid, item);
+	else {
+		item->pid->ns_level = -1;
+		item->pid->leaf_ns_id = ALL_PID_NS_ID;
+		item->pid->real = -1;
+		item->pid->local = -1;
 		item->pid->uid = -1;
-	item->pid->state = TASK_UNDEF;
-	item->pid->stop_signo = -1;
+		item->pid->state = TASK_UNDEF;
+		item->pid->stop_signo = -1;
+		item->pid->item = item;
+		rb_init_node(&item->pid->leaf_ns_node);
+		rb_init_node(&item->pid->root_ns_node);
+		rb_init_node(&item->pid->uid_node);
+	}
 	item->born_sid = -1;
 	item->tfork_pidfd = -1;
 	item->tfork_memfd = -1;
 	item->tfork_pagemap_fd = -1;
-	item->pid->item = item;
 	futex_init(&item->task_st);
-	rb_init_node(&item->pid->leaf_ns_node);
-	rb_init_node(&item->pid->root_ns_node);
-	rb_init_node(&item->pid->uid_node);
 
 	return item;
 }

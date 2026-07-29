@@ -885,6 +885,7 @@ static int collect_pstree_ids_predump(void)
 	 * write_img_inventory().
 	 */
 
+	pid_init_dump(crt.i.pid, &crt.i);
 	crt.i.pid->state = TASK_ALIVE;
 	crt.i.pid->real = getpid();
 

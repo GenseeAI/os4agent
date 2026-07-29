@@ -3,18 +3,40 @@
 #include <assert.h>
 
 #include "log.h"
+#include "pstree.h"
 #include "util.h"
 #include "criu-log.h"
 
 int parse_statement(int i, char *line, char **configuration);
 
+atomic_t pid_uid_generator = ATOMIC_INIT(0);
+
 int main(int argc, char *argv[], char *envp[])
 {
 	char **configuration;
+	struct pid first_pid = {};
+	struct pid second_pid = {};
+	struct pstree_item first_item = { .pid = &first_pid };
+	struct pstree_item second_item = { .pid = &second_pid };
 	int i;
 
 	configuration = malloc(10 * sizeof(char *));
 	log_init(NULL);
+
+	pid_init_dump(&first_pid, &first_item);
+	pid_init_dump(&second_pid, &second_item);
+	assert(first_pid.uid > 0);
+	assert(second_pid.uid > first_pid.uid);
+	assert(first_pid.item == &first_item);
+	assert(first_pid.real == -1);
+	assert(first_pid.local == -1);
+	assert(first_pid.state == TASK_UNDEF);
+	assert(first_pid.stop_signo == -1);
+	assert(first_pid.ns_level == -1);
+	assert(first_pid.leaf_ns_id == ALL_PID_NS_ID);
+	assert(RB_EMPTY_NODE(&first_pid.leaf_ns_node));
+	assert(RB_EMPTY_NODE(&first_pid.root_ns_node));
+	assert(RB_EMPTY_NODE(&first_pid.uid_node));
 
 	i = parse_statement(0, "", configuration);
 	assert(i == 0);
