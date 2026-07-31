@@ -528,6 +528,22 @@ func (c *Container) CleanupExternalCloneStorage() {
 		return
 	}
 
+	// Direct n-copy tfork uses a small runtime-only publication directory for
+	// attach/log plumbing.  It is outside the graphroot bundle and therefore
+	// was not covered by the storage teardown below.
+	runtimeBundle := filepath.Clean(c.config.ExternalBundlePath)
+	runtimeRoot := filepath.Clean("/run/libpod/tfork")
+	if runtimeBundle != "" && runtimeBundle != "." &&
+		strings.HasPrefix(runtimeBundle, runtimeRoot+string(os.PathSeparator)) {
+		if err := os.RemoveAll(runtimeBundle); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			logrus.Debugf("tfork: clone %s rm runtime bundle %s: %v", c.ID(), runtimeBundle, err)
+		}
+		parent := filepath.Dir(runtimeBundle)
+		if entries, err := os.ReadDir(parent); err == nil && len(entries) == 0 {
+			_ = os.Remove(parent)
+		}
+	}
+
 	if hpid := c.config.TforkDumpdHolderPid; hpid > 0 {
 		expectedStart := c.config.TforkDumpdHolderStartTime
 		curStart, stErr := ReadProcStartTime(hpid)
