@@ -598,6 +598,25 @@ func (ic *ContainerEngine) containerCloneLive(ctx context.Context, opts entities
 		logrus.Infof("tfork: clone %s up via conmon pid=%d; log=%s", cloneIDs[0], conmonPid, logPath)
 	} else {
 		directArgs := append([]string{}, crunArgs...)
+		eventReadiness := os.Getenv("PODMAN_TFORK_EVENT_READINESS") == "1"
+		var sourceDetachedRead *os.File
+		var sourceDetachedWrite *os.File
+		var sourceDetachedDone chan error
+		if eventReadiness {
+			var err error
+			sourceDetachedRead, sourceDetachedWrite, err = os.Pipe()
+			if err != nil {
+				return nil, fmt.Errorf("create source-detached event pipe: %w", err)
+			}
+			defer func() {
+				if sourceDetachedRead != nil {
+					_ = sourceDetachedRead.Close()
+				}
+				if sourceDetachedWrite != nil {
+					_ = sourceDetachedWrite.Close()
+				}
+			}()
+		}
 		if dumpdHolderPid > 0 {
 			directArgs = append(directArgs,
 				fmt.Sprintf("--tfork-dumpd-parent=%d", dumpdHolderPid))
@@ -639,12 +658,16 @@ func (ic *ContainerEngine) containerCloneLive(ctx context.Context, opts entities
 		for _, pcArg := range perCopyArgs {
 			directArgs = append(directArgs, pcArg)
 		}
+		nextExtraFD := 3 + len(perCopyExtraFiles)
+		if hasTTY && !skipTtySrcFds {
+			nextExtraFD += len(ttySrcFds)
+		}
 		if socketPurgeRead != nil {
-			barrierFD := 3 + len(perCopyExtraFiles)
-			if hasTTY && !skipTtySrcFds {
-				barrierFD += len(ttySrcFds)
-			}
-			directArgs = append(directArgs, "--tfork-pre-restore-fd", strconv.Itoa(barrierFD))
+			directArgs = append(directArgs, "--tfork-pre-restore-fd", strconv.Itoa(nextExtraFD))
+			nextExtraFD++
+		}
+		if sourceDetachedWrite != nil {
+			directArgs = append(directArgs, "--tfork-source-detached-fd", strconv.Itoa(nextExtraFD))
 		}
 		directArgs = append(directArgs, cloneIDs[0])
 		crunCmd := exec.Command(defaultCrunPath, directArgs...)
@@ -657,6 +680,9 @@ func (ic *ContainerEngine) containerCloneLive(ctx context.Context, opts entities
 		}
 		if socketPurgeRead != nil {
 			crunCmd.ExtraFiles = append(crunCmd.ExtraFiles, socketPurgeRead)
+		}
+		if sourceDetachedWrite != nil {
+			crunCmd.ExtraFiles = append(crunCmd.ExtraFiles, sourceDetachedWrite)
 		}
 		logPath := filepath.Join(bundleDir, "crun-tfork.log")
 		logF, err := os.Create(logPath)
@@ -672,6 +698,19 @@ func (ic *ContainerEngine) containerCloneLive(ctx context.Context, opts entities
 		if socketPurgeRead != nil {
 			_ = socketPurgeRead.Close()
 			socketPurgeRead = nil
+		}
+		if sourceDetachedWrite != nil {
+			_ = sourceDetachedWrite.Close()
+			sourceDetachedWrite = nil
+			sourceDetachedDone = make(chan error, 1)
+			go func() {
+				var byte [1]byte
+				n, err := sourceDetachedRead.Read(byte[:])
+				if err == nil && n != 1 {
+					err = fmt.Errorf("short source-detached event read: %d bytes", n)
+				}
+				sourceDetachedDone <- err
+			}()
 		}
 		txn.trackPID(crunCmd.Process.Pid, "crun-tfork")
 		crunDone := make(chan error, 1)
@@ -744,51 +783,101 @@ func (ic *ContainerEngine) containerCloneLive(ctx context.Context, opts entities
 		stateReady := !needState
 		crunExited := false
 		var crunErr error
-		for readyCopies < copies || !stateReady {
-			if !crunExited {
+		if eventReadiness {
+			timer := time.NewTimer(cloneReadyTimeout)
+			defer timer.Stop()
+			sourceDetached := false
+			for !crunExited || !sourceDetached {
 				select {
+				case detachErr := <-sourceDetachedDone:
+					if detachErr != nil {
+						tforkAbortCrunCmd(crunCmd, src, bundleDir, copies)
+						crunAborted = true
+						return nil, fmt.Errorf("wait for tfork source-detached event: %w; see %s", detachErr, logPath)
+					}
+					sourceDetached = true
+					if err := txn.restoreSourceOnce(); err != nil {
+						tforkAbortCrunCmd(crunCmd, src, bundleDir, copies)
+						crunAborted = true
+						return nil, fmt.Errorf("early thaw at tfork source-detached event: %w", err)
+					}
+					logrus.Infof("tfork: source thawed at CRIU source-detached event")
 				case crunErr = <-crunDone:
 					crunExited = true
-				default:
+					if crunErr != nil {
+						tforkAbortCrunCmd(crunCmd, src, bundleDir, copies)
+						crunAborted = true
+						return nil, fmt.Errorf("crun tfork failed before event readiness: %w; see %s", crunErr, logPath)
+					}
+				case <-timer.C:
+					tforkAbortCrunCmd(crunCmd, src, bundleDir, copies)
+					crunAborted = true
+					return nil, fmt.Errorf("timeout waiting %s for tfork source-detached and runtime-exit events; see %s",
+						cloneReadyTimeout, logPath)
 				}
 			}
+
 			readyCopies = 0
 			for i := 0; i < copies; i++ {
 				if _, err := os.Stat(pidFileFor(i)); err == nil {
 					readyCopies++
 				}
 			}
-			if needState && !stateReady {
-				if _, err := os.Stat(statePath); err == nil {
-					stateReady = true
+			if needState {
+				_, err := os.Stat(statePath)
+				stateReady = err == nil
+			}
+			if readyCopies < copies || !stateReady {
+				return nil, fmt.Errorf("crun exited successfully but clone readiness artifacts are incomplete: pidfiles=%d/%d stateReady=%v; see %s",
+					readyCopies, copies, stateReady, logPath)
+			}
+		} else {
+			for readyCopies < copies || !stateReady {
+				if !crunExited {
+					select {
+					case crunErr = <-crunDone:
+						crunExited = true
+					default:
+					}
 				}
+				readyCopies = 0
+				for i := 0; i < copies; i++ {
+					if _, err := os.Stat(pidFileFor(i)); err == nil {
+						readyCopies++
+					}
+				}
+				if needState && !stateReady {
+					if _, err := os.Stat(statePath); err == nil {
+						stateReady = true
+					}
+				}
+				if readyCopies >= copies && stateReady {
+					break
+				}
+				if crunExited && readyCopies < copies {
+					tforkAbortCrunCmd(crunCmd, src, bundleDir, copies)
+					crunAborted = true
+					return nil, fmt.Errorf("crun tfork exited before %d clones came up (got %d); see %s",
+						copies, readyCopies, logPath)
+				}
+				if time.Now().After(deadline) {
+					tforkAbortCrunCmd(crunCmd, src, bundleDir, copies)
+					crunAborted = true
+					return nil, fmt.Errorf("timeout waiting for %d tfork.pid* files in %s (got %d, stateReady=%v); see %s",
+						copies, imgDir, readyCopies, stateReady, logPath)
+				}
+				time.Sleep(tforkClonePollInterval)
 			}
-			if readyCopies >= copies && stateReady {
-				break
-			}
-			if crunExited && readyCopies < copies {
-				tforkAbortCrunCmd(crunCmd, src, bundleDir, copies)
-				crunAborted = true
-				return nil, fmt.Errorf("crun tfork exited before %d clones came up (got %d); see %s",
-					copies, readyCopies, logPath)
-			}
-			if time.Now().After(deadline) {
-				tforkAbortCrunCmd(crunCmd, src, bundleDir, copies)
-				crunAborted = true
-				return nil, fmt.Errorf("timeout waiting for %d tfork.pid* files in %s (got %d, stateReady=%v); see %s",
-					copies, imgDir, readyCopies, stateReady, logPath)
-			}
-			time.Sleep(tforkClonePollInterval)
-		}
-		if !crunExited {
-			select {
-			case crunErr = <-crunDone:
-				crunExited = true
-			case <-time.After(cloneReadyTimeout):
-				tforkAbortCrunCmd(crunCmd, src, bundleDir, copies)
-				crunAborted = true
-				return nil, fmt.Errorf("timeout waiting %s for crun tfork to finish after %d clones came up; see %s",
-					cloneReadyTimeout, copies, logPath)
+			if !crunExited {
+				select {
+				case crunErr = <-crunDone:
+					crunExited = true
+				case <-time.After(cloneReadyTimeout):
+					tforkAbortCrunCmd(crunCmd, src, bundleDir, copies)
+					crunAborted = true
+					return nil, fmt.Errorf("timeout waiting %s for crun tfork to finish after %d clones came up; see %s",
+						cloneReadyTimeout, copies, logPath)
+				}
 			}
 		}
 		if crunErr != nil {

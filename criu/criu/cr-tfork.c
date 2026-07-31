@@ -615,6 +615,8 @@ static int cr_tfork_finish(int ret)
 
 	pstree_switch_state(root_item, TASK_ALIVE);
 	timing_stop(TIME_FROZEN);
+	if (run_scripts(ACT_TFORK_SOURCE_DETACHED))
+		pr_warn("tfork: source-detached notification failed\n");
 
 	seccomp_free_entries();
 	free_file_locks();
