@@ -49,16 +49,16 @@ cleanup()
 {
 	exec 8<&- 9<&-
 	if btrfs subvolume show "$child_subvol" >/dev/null 2>&1; then
-		btrfs subvolume delete -q "$child_subvol" >/dev/null
+		btrfs subvolume delete "$child_subvol" >/dev/null
 	fi
 	if btrfs subvolume show "$source_subvol" >/dev/null 2>&1; then
-		btrfs subvolume delete -q "$source_subvol" >/dev/null
+		btrfs subvolume delete "$source_subvol" >/dev/null
 	fi
 	rmdir "$workdir" 2>/dev/null || true
 }
 trap cleanup EXIT
 
-btrfs subvolume create -q "$source_subvol"
+btrfs subvolume create "$source_subvol" >/dev/null
 printf 'filecow-layer-lifetime\n' >"$source_subvol/cached"
 : >"$source_subvol/empty"
 sync -f "$source_subvol/cached"
@@ -75,11 +75,11 @@ no_layer_before="$(stat_value fork_no_layer)"
 reused_before="$(stat_value fork_reused_layer)"
 
 for ((i = 0; i < LOOPS; i++)); do
-	btrfs subvolume snapshot -q "$source_subvol" "$child_subvol"
+	btrfs subvolume snapshot "$source_subvol" "$child_subvol" >/dev/null
 	[[ "$(cat "$child_subvol/cached")" == filecow-layer-lifetime ]] ||
 		fail "snapshot data mismatch in iteration $i"
 	stat "$child_subvol/empty" >/dev/null
-	btrfs subvolume delete -q "$child_subvol" >/dev/null
+	btrfs subvolume delete "$child_subvol" >/dev/null
 done
 
 allocated_after="$(stat_value layers_allocated)"
