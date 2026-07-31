@@ -385,10 +385,10 @@ func (ic *ContainerEngine) containerCloneLive(ctx context.Context, opts entities
 		opts.TforkNetworkLock = "nftables"
 	}
 	switch opts.TforkNetworkLock {
-	case "iptables", "nftables", "skip":
+	case "iptables", "nftables":
 		crunArgs = append(crunArgs, "--network-lock", opts.TforkNetworkLock)
 	default:
-		return nil, fmt.Errorf("invalid --tfork-network-lock value %q (must be \"iptables\", \"nftables\", or \"skip\")", opts.TforkNetworkLock)
+		return nil, fmt.Errorf("invalid --tfork-network-lock value %q (must be \"iptables\" or \"nftables\")", opts.TforkNetworkLock)
 	}
 	dumpdHolderPid := 0
 	var dumpdHolderStartTime uint64
