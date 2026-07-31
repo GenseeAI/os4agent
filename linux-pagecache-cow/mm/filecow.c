@@ -1180,7 +1180,6 @@ int address_space_fork(struct address_space *new, struct address_space *source)
 	kvfree(batch);
 	kvfree(indices);
 
-install:
 	spin_lock(&L->sharers_lock);
 	refcount_set(&L->refs, 2 + moved);
 	source->ro = L;
