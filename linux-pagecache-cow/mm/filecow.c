@@ -42,6 +42,11 @@ EXPORT_SYMBOL_GPL(filecow_stat_ra_order_layer_fallback);
 static atomic_long_t filecow_stat_lookup_install = ATOMIC_LONG_INIT(0);
 static atomic_long_t filecow_stat_lookup_miss = ATOMIC_LONG_INIT(0);
 static atomic_long_t filecow_stat_folios_unaccounted = ATOMIC_LONG_INIT(0);
+static atomic_long_t filecow_stat_layers_allocated = ATOMIC_LONG_INIT(0);
+static atomic_long_t filecow_stat_layers_freed = ATOMIC_LONG_INIT(0);
+static atomic_long_t filecow_stat_layers_active = ATOMIC_LONG_INIT(0);
+static atomic_long_t filecow_stat_fork_no_layer = ATOMIC_LONG_INIT(0);
+static atomic_long_t filecow_stat_fork_reused_layer = ATOMIC_LONG_INIT(0);
 static atomic_long_t filecow_diag_evict_ok = ATOMIC_LONG_INIT(0);
 static atomic_long_t filecow_diag_evict_refuse = ATOMIC_LONG_INIT(0);
 static atomic_long_t filecow_diag_evict_skipped = ATOMIC_LONG_INIT(0);
@@ -90,6 +95,16 @@ static int filecow_stats_show(struct seq_file *m, void *v)
 		   atomic_long_read(&filecow_stat_ra_order_layer_fallback));
 	seq_printf(m, "folios_unaccounted %ld\n",
 		   atomic_long_read(&filecow_stat_folios_unaccounted));
+	seq_printf(m, "layers_allocated %ld\n",
+		   atomic_long_read(&filecow_stat_layers_allocated));
+	seq_printf(m, "layers_freed %ld\n",
+		   atomic_long_read(&filecow_stat_layers_freed));
+	seq_printf(m, "layers_active %ld\n",
+		   atomic_long_read(&filecow_stat_layers_active));
+	seq_printf(m, "fork_no_layer %ld\n",
+		   atomic_long_read(&filecow_stat_fork_no_layer));
+	seq_printf(m, "fork_reused_layer %ld\n",
+		   atomic_long_read(&filecow_stat_fork_reused_layer));
 	seq_printf(m, "diag_evict_ok %ld\n",
 		   atomic_long_read(&filecow_diag_evict_ok));
 	seq_printf(m, "diag_evict_refuse %ld\n",
@@ -372,6 +387,8 @@ struct filecow_layer *filecow_layer_alloc(struct address_space *primary)
 	INIT_LIST_HEAD(&layer->children);
 	INIT_LIST_HEAD(&layer->sibling_link);
 	layer->wb_err = 0;
+	atomic_long_inc(&filecow_stat_layers_allocated);
+	atomic_long_inc(&filecow_stat_layers_active);
 	return layer;
 }
 
@@ -380,6 +397,8 @@ static void __filecow_layer_free_rcu(struct rcu_head *head)
 	struct filecow_layer *layer = container_of(head, struct filecow_layer, rcu);
 	WARN_ON_ONCE(!list_empty(&layer->sharers));
 	WARN_ON_ONCE(!list_empty(&layer->children));
+	atomic_long_inc(&filecow_stat_layers_freed);
+	atomic_long_dec(&filecow_stat_layers_active);
 	kmem_cache_free(filecow_layer_cache, layer);
 }
 
@@ -896,6 +915,37 @@ post_detach:
 }
 EXPORT_SYMBOL_GPL(filecow_aggressive_evict);
 
+/*
+ * Return true when @mapping contains state which is newer than mapping->ro
+ * and therefore must be captured in a new layer.  Filecow folios in i_pages
+ * are only local lookup aliases for an existing layer and ordinary XArray
+ * values are reclaim metadata.  A tombstone or a normal folio, however,
+ * changes what a descendant must observe.
+ *
+ * The caller holds the mapping invalidate lock for write.  The XArray lock
+ * closes the remaining race with reclaim while the frozen source is inspected.
+ */
+static bool filecow_mapping_has_private_state(struct address_space *mapping)
+{
+	struct folio *folio;
+	bool has_private = false;
+	XA_STATE(xas, &mapping->i_pages, 0);
+
+	xas_lock_irq(&xas);
+	xas_for_each(&xas, folio, ULONG_MAX) {
+		if (xas_retry(&xas, folio))
+			continue;
+		if (xa_is_tombstone(folio) ||
+		    (!xa_is_value(folio) && !folio_test_filecow(folio))) {
+			has_private = true;
+			break;
+		}
+	}
+	xas_unlock_irq(&xas);
+
+	return has_private;
+}
+
 int address_space_fork(struct address_space *new, struct address_space *source)
 {
 	struct filecow_layer *L;
@@ -944,6 +994,35 @@ int address_space_fork(struct address_space *new, struct address_space *source)
 		ret = -EBUSY;
 		goto out_unlock;
 	}
+
+	/*
+	 * A clean mapping without a filecow layer has no in-memory state to
+	 * preserve.  The filesystem snapshot already supplies the child's data,
+	 * so creating an empty layer here only retains one unnecessary layer per
+	 * inode in a long-lived source's generation chain.
+	 */
+	if (!source->ro && !filecow_mapping_has_private_state(source)) {
+		atomic_long_inc(&filecow_stat_fork_no_layer);
+		goto out_unlock;
+	}
+
+	/*
+	 * When all local entries are aliases of the current immutable layer,
+	 * attach the child to that layer directly.  Repeated forks of an
+	 * unchanged source then consume one sharer reference per live child,
+	 * rather than permanently extending the layer chain.
+	 */
+	if (source->ro && !filecow_mapping_has_private_state(source)) {
+		L = source->ro;
+		spin_lock(&L->sharers_lock);
+		refcount_inc(&L->refs);
+		new->ro = L;
+		list_add(&new->filecow_link, &L->sharers);
+		spin_unlock(&L->sharers_lock);
+		atomic_long_inc(&filecow_stat_fork_reused_layer);
+		goto out_unlock;
+	}
+
 	L = filecow_layer_alloc(source);
 	if (!L) {
 		ret = -ENOMEM;
@@ -1090,6 +1169,8 @@ out_free_layer:
 		spin_unlock(&L->below->sharers_lock);
 	}
 
+	atomic_long_inc(&filecow_stat_layers_freed);
+	atomic_long_dec(&filecow_stat_layers_active);
 	kmem_cache_free(filecow_layer_cache, L);
 	kvfree(batch);
 	kvfree(indices);
