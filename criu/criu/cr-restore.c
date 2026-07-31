@@ -5,6 +5,7 @@
 #include <unistd.h>
 #include <errno.h>
 #include <string.h>
+#include <time.h>
 
 #include <fcntl.h>
 
@@ -117,6 +118,48 @@
 #define arch_export_restore_task __export_restore_task
 #endif
 
+static bool tfork_restore_profile;
+static uint64_t tfork_restore_profile_origin;
+static uint64_t tfork_restore_profile_last;
+static unsigned int tfork_restore_wait_seq;
+
+static uint64_t tfork_restore_profile_now(void)
+{
+	struct timespec ts;
+
+	if (clock_gettime(CLOCK_MONOTONIC, &ts))
+		return 0;
+	return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+}
+
+static void tfork_restore_profile_init(void)
+{
+	const char *value = getenv("CRIU_TFORK_PROFILE");
+
+	tfork_restore_profile = opts.tfork.active && value && value[0] &&
+		strcmp(value, "0");
+	if (!tfork_restore_profile)
+		return;
+	tfork_restore_profile_origin = tfork_restore_profile_now();
+	tfork_restore_profile_last = tfork_restore_profile_origin;
+	tfork_restore_wait_seq = 0;
+	pr_warn("tfork-profile: phase=B-restore mark=start pid=%d\n", getpid());
+}
+
+static void tfork_restore_profile_mark(const char *mark)
+{
+	uint64_t now;
+
+	if (!tfork_restore_profile)
+		return;
+	now = tfork_restore_profile_now();
+	pr_warn("tfork-profile: phase=B-restore mark=%s pid=%d delta_us=%llu elapsed_us=%llu\n",
+		mark, getpid(),
+		(unsigned long long)((now - tfork_restore_profile_last) / 1000ULL),
+		(unsigned long long)((now - tfork_restore_profile_origin) / 1000ULL));
+	tfork_restore_profile_last = now;
+}
+
 #ifndef arch_export_unmap
 #define arch_export_unmap	 __export_unmap
 #define arch_export_unmap_compat __export_unmap_compat
@@ -186,6 +229,15 @@ static int __restore_wait_inprogress_tasks(int participants)
 	int ret;
 	futex_t *np = &task_entries->nr_in_progress;
 	const int tfork_restore_wait_timeout_ms = 10000;
+	uint64_t profile_started = 0;
+	unsigned int profile_seq = 0;
+	int profile_initial = 0;
+
+	if (tfork_restore_profile) {
+		profile_started = tfork_restore_profile_now();
+		profile_seq = ++tfork_restore_wait_seq;
+		profile_initial = (int)futex_get(np);
+	}
 
 	if (opts.tfork.active) {
 		struct timespec started, now, timeout;
@@ -249,6 +301,16 @@ static int __restore_wait_inprogress_tasks(int participants)
 		}
 	} else {
 		futex_wait_while_gt(np, participants);
+	}
+
+	if (profile_started) {
+		uint64_t now = tfork_restore_profile_now();
+
+		pr_warn("tfork-profile: phase=B-wait seq=%u pid=%d stage=%d "
+			"participants=%d initial=%d final=%d duration_us=%llu\n",
+			profile_seq, getpid(), (int)futex_get(&task_entries->start),
+			participants, profile_initial, (int)futex_get(np),
+			(unsigned long long)((now - profile_started) / 1000ULL));
 	}
 
 	ret = (int)futex_get(np);
@@ -2564,6 +2626,7 @@ static int restore_root_task(struct pstree_item *init)
 		pr_err("Failed to prepare namespace before tasks\n");
 		return -1;
 	}
+	tfork_restore_profile_mark("root-pre-restore-and-namespace-prep");
 
 	if (localpid(init) == INIT_PID) {
 		if (!(root_ns_mask & CLONE_NEWPID)) {
@@ -2613,6 +2676,7 @@ static int restore_root_task(struct pstree_item *init)
 		pr_err("fork_with_pid failed: %d\n", ret);
 		goto out;
 	}
+	tfork_restore_profile_mark("fork-root-task");
 
 	if (is_simple_userns_tree()) {
 		if (prepare_userns(init)) {
@@ -2671,6 +2735,7 @@ static int restore_root_task(struct pstree_item *init)
 		pr_err("restore_wait_inprogress_tasks failed: %d\n", ret);
 		goto out_kill;
 	}
+	tfork_restore_profile_mark("wait-namespaces-created");
 
 	ret = run_scripts(ACT_SETUP_NS);
 	if (ret) {
@@ -2687,6 +2752,7 @@ static int restore_root_task(struct pstree_item *init)
 		pr_err("Root task logs above show which step failed (err_step).\n");
 		goto out_kill;
 	}
+	tfork_restore_profile_mark("prepare-namespaces-stage");
 
 	if (root_ns_mask & CLONE_NEWNS) {
 		mnt_ns_fd = open_proc(init->pid->real, "ns/mnt");
@@ -2731,6 +2797,7 @@ skip_ns_bouncing:
 		pr_err("restore_wait_inprogress_tasks (post-fork) failed: %d\n", ret);
 		goto out_kill;
 	}
+	tfork_restore_profile_mark("post-fork-wait");
 
 	ret = apply_memfd_seals();
 	if (ret < 0) {
@@ -2774,6 +2841,7 @@ skip_ns_bouncing:
 		pr_err("restore_switch_stage RESTORE_SIGCHLD failed: %d\n", ret);
 		goto out_kill;
 	}
+	tfork_restore_profile_mark("restore-sigchld-stage");
 
 	ret = stop_usernsd();
 	if (ret < 0) {
@@ -2829,8 +2897,10 @@ skip_ns_bouncing:
 		pr_err("write_restored_pid failed\n");
 		goto out_kill;
 	}
+	tfork_restore_profile_mark("post-restore-housekeeping");
 
 	network_unlock();
+	tfork_restore_profile_mark("network-unlock");
 
 	/*
 	 * Stop getting sigchld, after we resume the tasks they
@@ -2847,11 +2917,13 @@ skip_ns_bouncing:
 		pr_err("attach_to_tasks failed\n");
 		goto out_kill_network_unlocked;
 	}
+	tfork_restore_profile_mark("attach-restored-tasks");
 
 	if (restore_switch_stage(CR_STATE_RESTORE_CREDS)) {
 		pr_err("restore_switch_stage RESTORE_CREDS failed\n");
 		goto out_kill_network_unlocked;
 	}
+	tfork_restore_profile_mark("restore-creds-stage");
 
 	timing_stop(TIME_RESTORE);
 
@@ -2866,6 +2938,7 @@ skip_ns_bouncing:
 	}
 
 	__restore_switch_stage(CR_STATE_COMPLETE);
+	tfork_restore_profile_mark("catch-lazy-and-complete");
 
 	ret = compel_stop_on_syscall(task_entries->nr_threads, __NR(rt_sigreturn, 0), __NR(rt_sigreturn, 1));
 	if (ret) {
@@ -2878,6 +2951,7 @@ skip_ns_bouncing:
 	/* just before releasing threads we have to restore rseq_cs */
 	if (restore_rseq_cs())
 		pr_err("Unable to restore rseq_cs state\n");
+	tfork_restore_profile_mark("stop-finalize-and-rseq");
 
 	/*
 	 * Some external devices such as GPUs might need a very late
@@ -2917,6 +2991,7 @@ skip_ns_bouncing:
 		pr_err("finalize_restore_detach failed\n");
 		goto out_kill_network_unlocked;
 	}
+	tfork_restore_profile_mark("hooks-freezer-and-detach");
 
 	pr_info("Restore finished successfully. Tasks resumed.\n");
 	write_stats(RESTORE_STATS);
@@ -3035,6 +3110,7 @@ int cr_restore_tasks(void)
 
 	if (init_service_fd())
 		return 1;
+	tfork_restore_profile_init();
 
 	if (check_async_memdump_inflight() < 0)
 		return -1;
@@ -3046,6 +3122,7 @@ int cr_restore_tasks(void)
 		if (tfork_read_cropt())
 			return -1;
 	}
+	tfork_restore_profile_mark("inventory-and-cropt");
 
 	if (init_stats(RESTORE_STATS))
 		return -1;
@@ -3091,6 +3168,7 @@ int cr_restore_tasks(void)
 			}
 		}
 	}
+	tfork_restore_profile_mark("task-entries-and-pstree");
 
 	if (fdstore_init())
 		return -1;
@@ -3109,6 +3187,7 @@ int cr_restore_tasks(void)
 
 	if (crtools_prepare_shared() < 0)
 		goto err;
+	tfork_restore_profile_mark("fdstore-plugins-and-shared");
 
 	if (prepare_cgroup())
 		goto clean_cgroup;
@@ -3118,8 +3197,10 @@ int cr_restore_tasks(void)
 
 	if (prepare_lazy_pages_socket() < 0)
 		goto clean_cgroup;
+	tfork_restore_profile_mark("cgroup-signals-and-lazy-pages");
 
 	ret = restore_root_task(root_item);
+	tfork_restore_profile_mark("restore-root-returned");
 clean_cgroup:
 	fini_cgroup();
 err:

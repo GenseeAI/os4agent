@@ -12,8 +12,10 @@ OUTPUT=${OUTPUT:-/tmp/tfork-phase-b-ab.tsv}
 OS4AGENT_CRUN=${OS4AGENT_CRUN:-crun}
 WORKLOAD_PROCESSES=${WORKLOAD_PROCESSES:-1}
 LOG_DIR=${LOG_DIR:-}
+TFORK_CLONE_ARGS=${TFORK_CLONE_ARGS:-}
 
 read -r -a podman_global_args <<<"$PODMAN_GLOBAL_ARGS"
+read -r -a tfork_clone_args <<<"$TFORK_CLONE_ARGS"
 source_name=${PREFIX}-source
 
 podman_cmd() {
@@ -42,7 +44,8 @@ run_clone() {
 		LD_LIBRARY_PATH="$root/lib/c${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
 		OS4AGENT_CRUN="$OS4AGENT_CRUN" \
 		"$PODMAN" "${podman_global_args[@]}" container clone \
-		--live --tfork-overlay-btrfs "$source_name" "$name" >/dev/null
+		--live --tfork-overlay-btrfs "${tfork_clone_args[@]}" \
+		"$source_name" "$name" >/dev/null
 	ended=$(date +%s%N)
 	elapsed=$(( (ended - started) / 1000000 ))
 
