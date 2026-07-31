@@ -503,6 +503,7 @@ type ContainerCloneOptions struct {
 	TforkGhostLimit   uint
 	TforkTCPClose     bool
 	TforkFullMemcopy  bool
+	TforkNetworkLock  string
 	TforkOverlayBtrfs bool
 }
 
