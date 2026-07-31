@@ -954,6 +954,7 @@ int address_space_fork(struct address_space *new, struct address_space *source)
 	unsigned long *share_bitmap = NULL;
 	int n = 0, capacity, i, moved = 0;
 	int ret = 0;
+	bool has_private_state;
 	XA_STATE(xas, &source->i_pages, 0);
 
 	if (!READ_ONCE(sysctl_filecow_enabled))
@@ -994,6 +995,7 @@ int address_space_fork(struct address_space *new, struct address_space *source)
 		ret = -EBUSY;
 		goto out_unlock;
 	}
+	has_private_state = filecow_mapping_has_private_state(source);
 
 	/*
 	 * A clean mapping without a filecow layer has no in-memory state to
@@ -1001,7 +1003,7 @@ int address_space_fork(struct address_space *new, struct address_space *source)
 	 * so creating an empty layer here only retains one unnecessary layer per
 	 * inode in a long-lived source's generation chain.
 	 */
-	if (!source->ro && !filecow_mapping_has_private_state(source)) {
+	if (!source->ro && !has_private_state) {
 		atomic_long_inc(&filecow_stat_fork_no_layer);
 		goto out_unlock;
 	}
@@ -1012,7 +1014,7 @@ int address_space_fork(struct address_space *new, struct address_space *source)
 	 * unchanged source then consume one sharer reference per live child,
 	 * rather than permanently extending the layer chain.
 	 */
-	if (source->ro && !filecow_mapping_has_private_state(source)) {
+	if (source->ro && !has_private_state) {
 		L = source->ro;
 		spin_lock(&L->sharers_lock);
 		refcount_inc(&L->refs);
