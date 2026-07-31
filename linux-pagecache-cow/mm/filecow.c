@@ -926,7 +926,7 @@ EXPORT_SYMBOL_GPL(filecow_aggressive_evict);
  * closes the remaining race with reclaim while the frozen source is inspected.
  */
 static bool filecow_mapping_has_private_state(struct address_space *mapping,
-					       bool *has_tombstone)
+					      bool *has_tombstone)
 {
 	struct folio *folio;
 	bool has_private = false;
@@ -942,9 +942,8 @@ static bool filecow_mapping_has_private_state(struct address_space *mapping,
 			has_private = true;
 			continue;
 		}
-		if (!xa_is_value(folio) && !folio_test_filecow(folio)) {
+		if (!xa_is_value(folio) && !folio_test_filecow(folio))
 			has_private = true;
-		}
 	}
 	xas_unlock_irq(&xas);
 
@@ -1036,9 +1035,9 @@ int address_space_fork(struct address_space *new, struct address_space *source)
 	capacity = source->nrpages;
 	if (capacity != 0) {
 		batch = kvmalloc_array(capacity, sizeof(*batch),
-				      GFP_KERNEL | __GFP_NOWARN);
+				       GFP_KERNEL | __GFP_NOWARN);
 		indices = kvmalloc_array(capacity, sizeof(*indices),
-					GFP_KERNEL | __GFP_NOWARN);
+					 GFP_KERNEL | __GFP_NOWARN);
 		if (!batch || !indices) {
 			ret = -ENOMEM;
 			goto out_free_arrays;
@@ -1067,12 +1066,13 @@ int address_space_fork(struct address_space *new, struct address_space *source)
 		}
 		xas_unlock_irq(&xas);
 
-		share_bitmap = kvmalloc(BITS_TO_LONGS(n) * sizeof(long),
-					GFP_KERNEL | __GFP_ZERO);
+		share_bitmap = kvmalloc_array(BITS_TO_LONGS(n), sizeof(long),
+					      GFP_KERNEL | __GFP_ZERO);
 		if (share_bitmap && source->a_ops &&
 		    source->a_ops->folio_extents_shared_bulk) {
-			source->a_ops->folio_extents_shared_bulk(
-				source, new, indices, n, share_bitmap);
+			source->a_ops->folio_extents_shared_bulk(source, new,
+								 indices, n,
+								 share_bitmap);
 			atomic_long_inc(&filecow_stat_bulk_hook_used);
 			any_shareable = !bitmap_empty(share_bitmap, n);
 		} else {
