@@ -11,6 +11,7 @@ PREFIX=${PREFIX:-tfork-network-smoke-$RANDOM}
 read -r -a podman_global_args <<<"$PODMAN_GLOBAL_ARGS"
 source_name=${PREFIX}-source
 clone_name=${PREFIX}-clone
+unsafe_name=${PREFIX}-unsafe
 
 podman_cmd() {
 	"$PODMAN" "${podman_global_args[@]}" "$@"
@@ -18,6 +19,7 @@ podman_cmd() {
 
 cleanup() {
 	podman_cmd rm -f -t 0 "$clone_name" >/dev/null 2>&1 || true
+	podman_cmd rm -f -t 0 "$unsafe_name" >/dev/null 2>&1 || true
 	podman_cmd rm -f -t 0 "$source_name" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
@@ -58,6 +60,19 @@ if ((attempt == 100)); then
 	exit 1
 fi
 assert_no_criu_table "$source_name"
+
+if env \
+	PATH="$CRIU_ROOT/criu:$PATH" \
+	LD_LIBRARY_PATH="$CRIU_ROOT/lib/c${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+	OS4AGENT_CRUN="$OS4AGENT_CRUN" \
+	"$PODMAN" "${podman_global_args[@]}" container clone \
+	--live --tfork-overlay-btrfs \
+	--tfork-network-lock=skip \
+	"$source_name" "$unsafe_name" >/dev/null 2>&1; then
+	printf 'unsafe skip network backend was accepted\n' >&2
+	exit 1
+fi
+[[ $(podman_cmd exec "$source_name" cat /tmp/sentinel) == source-before-fork ]]
 
 env \
 	PATH="$CRIU_ROOT/criu:$PATH" \
