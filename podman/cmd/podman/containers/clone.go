@@ -69,7 +69,7 @@ func cloneFlags(cmd *cobra.Command) {
 	flags.BoolVar(&ctrClone.TforkFullMemcopy, tforkFullMemcopyFlagName, false, "ablation: physical-copy anon-private VMAs instead of CoW (for measuring the anon-CoW signal; only with --live)")
 
 	tforkNetworkLockFlagName := "tfork-network-lock"
-	flags.StringVar(&ctrClone.TforkNetworkLock, tforkNetworkLockFlagName, "nftables", "network lock backend: iptables, nftables, or skip (only with --live)")
+	flags.StringVar(&ctrClone.TforkNetworkLock, tforkNetworkLockFlagName, "nftables", "network lock backend: iptables or nftables (only with --live)")
 
 	common.DefineCreateDefaults(&ctrClone.CreateOpts)
 	common.DefineCreateFlags(cmd, &ctrClone.CreateOpts, entities.CloneMode)
