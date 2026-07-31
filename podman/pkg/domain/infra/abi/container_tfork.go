@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -23,6 +24,7 @@ import (
 	spec "github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/sirupsen/logrus"
 	"go.podman.io/common/libnetwork/types"
+	commonconfig "go.podman.io/common/pkg/config"
 	"go.podman.io/storage/pkg/stringid"
 	"golang.org/x/sys/unix"
 )
@@ -61,6 +63,9 @@ func (ic *ContainerEngine) containerCloneLive(ctx context.Context, opts entities
 	if state != define.ContainerStateRunning {
 		return nil, fmt.Errorf("source %q is not running (state=%s); tfork requires a live source", src.ID(), state.String())
 	}
+	if manager := src.CgroupManager(); manager != commonconfig.CgroupfsCgroupsManager {
+		return nil, fmt.Errorf("tfork currently requires the cgroupfs cgroup manager (source uses %q); retry Podman with --cgroup-manager=cgroupfs", manager)
+	}
 
 	copies := opts.Copies
 	if copies <= 0 {
@@ -95,22 +100,26 @@ func (ic *ContainerEngine) containerCloneLive(ctx context.Context, opts entities
 	if err := os.MkdirAll(bundleDir, 0o700); err != nil {
 		return nil, fmt.Errorf("mkdir bundle: %w", err)
 	}
+	txn := newTforkCloneTransaction(ctx, ic.Libpod, src, bundleDir, copies)
+	defer func() {
+		if retErr != nil {
+			txn.rollback(retErr)
+		}
+	}()
 
 	snapRO := filepath.Join(bundleDir, "snap-ro")
 
+	if err := tforkInjectFault("before_freeze"); err != nil {
+		return nil, err
+	}
 	thawSource, err := tforkFreezeSourceCgroup(src, tforkSourceFreezeTimeout)
 	if err != nil {
 		return nil, fmt.Errorf("freeze source cgroup before tfork snapshot: %w", err)
 	}
-	sourceThawed := false
-	defer func() {
-		if sourceThawed {
-			return
-		}
-		if err := thawSource(); err != nil {
-			logrus.Warnf("tfork: thaw source cgroup after clone setup: %v", err)
-		}
-	}()
+	txn.setSourceRestore(thawSource)
+	if err := tforkInjectFault("after_freeze"); err != nil {
+		return nil, err
+	}
 
 	if out, err := exec.Command("sync").CombinedOutput(); err != nil {
 		return nil, fmt.Errorf("sync: %s: %w", out, err)
@@ -199,6 +208,10 @@ func (ic *ContainerEngine) containerCloneLive(ctx context.Context, opts entities
 				logrus.Warnf("tfork: read source resolv.conf %s: %v", srcResolv, rerr)
 			}
 		}
+	}
+	txn.setCloneIDs(cloneIDs)
+	if err := tforkInjectFault("after_filesystem"); err != nil {
+		return nil, err
 	}
 
 	if recursive && parentUpperFrozen != "" {
@@ -303,6 +316,7 @@ func (ic *ContainerEngine) containerCloneLive(ctx context.Context, opts entities
 	if err := os.MkdirAll(imgDir, 0o700); err != nil {
 		return nil, fmt.Errorf("mkdir img: %w", err)
 	}
+	txn.setImageDir(imgDir)
 
 	cloneCgroupPaths := make([]string, copies)
 	if cfg := src.Config(); cfg != nil {
@@ -313,8 +327,10 @@ func (ic *ContainerEngine) containerCloneLive(ctx context.Context, opts entities
 				return nil, fmt.Errorf("mkdir clone cgroup %s: %w", cgFS, err)
 			}
 			cloneCgroupPaths[i] = cgRel
+			txn.setCgroupPaths(cloneCgroupPaths)
 		}
 	}
+	txn.setCgroupPaths(cloneCgroupPaths)
 
 	srcStatePath := fmt.Sprintf("/run/crun/%s/status", src.ID())
 	crunArgs := []string{
@@ -427,6 +443,9 @@ func (ic *ContainerEngine) containerCloneLive(ctx context.Context, opts entities
 		crunArgs = append(crunArgs, "--parent-path", parentImgDir)
 		logrus.Infof("tfork: --with-previous chains off clone %s (imgDir=%s)", parentCloneID, parentImgDir)
 	}
+	if err := tforkInjectFault("before_restore"); err != nil {
+		return nil, err
+	}
 
 	cloneLogPaths := make([]string, copies)
 	cloneConmonPids := make([]int, copies)
@@ -478,6 +497,7 @@ func (ic *ContainerEngine) containerCloneLive(ctx context.Context, opts entities
 		}
 		cloneLogPaths[0] = logPath
 		cloneConmonPids[0] = conmonPid
+		txn.trackPID(conmonPid, "conmon")
 		logrus.Infof("tfork: clone %s up via conmon pid=%d; log=%s", cloneIDs[0], conmonPid, logPath)
 	} else {
 		directArgs := append([]string{}, crunArgs...)
@@ -542,6 +562,7 @@ func (ic *ContainerEngine) containerCloneLive(ctx context.Context, opts entities
 			logF.Close()
 			return nil, fmt.Errorf("start crun tfork: %w", err)
 		}
+		txn.trackPID(crunCmd.Process.Pid, "crun-tfork")
 		crunDone := make(chan error, 1)
 		var crunAborted bool
 		defer func() {
@@ -562,6 +583,7 @@ func (ic *ContainerEngine) containerCloneLive(ctx context.Context, opts entities
 			shortBatch = shortBatch[:12]
 		}
 		runtimeAttachBase := filepath.Join("/run/libpod/tfork", shortBatch)
+		txn.setRuntimeBatchDir(runtimeAttachBase)
 		for i := 0; i < copies; i++ {
 			perCopyBundle := filepath.Join(runtimeAttachBase, fmt.Sprintf("%d", i))
 			if err := os.MkdirAll(perCopyBundle, 0o700); err != nil {
@@ -584,8 +606,11 @@ func (ic *ContainerEngine) containerCloneLive(ctx context.Context, opts entities
 			} else {
 				cloneLogPath = filepath.Join(bundleDir, fmt.Sprintf("clone.%d.log", i))
 			}
-			if err := spawnTforkStdioHelper(readEnd, perCopyAttachSocks[i], cloneLogPath, hasTTY); err != nil {
+			helperPID, err := spawnTforkStdioHelper(readEnd, perCopyAttachSocks[i], cloneLogPath, hasTTY)
+			if err != nil {
 				logrus.Warnf("tfork: per-copy %d stdio-helper spawn: %v", i, err)
+			} else {
+				txn.trackPID(helperPID, fmt.Sprintf("stdio-helper-%d", i))
 			}
 			if perCopyAttachSocks[i] != nil {
 				_ = perCopyAttachSocks[i].Close()
@@ -663,12 +688,24 @@ func (ic *ContainerEngine) containerCloneLive(ctx context.Context, opts entities
 		}
 		logrus.Infof("tfork: batch %s up (N=%d); crun-tfork.log at %s", batchID, copies, logPath)
 	}
+	if err := tforkInjectFault("after_restore"); err != nil {
+		return nil, err
+	}
 
-	if err := thawSource(); err != nil {
+	if err := txn.restoreSourceOnce(); err != nil {
 		logrus.Warnf("tfork: clones are up, but thawing source cgroup after restore failed: %v", err)
 		return nil, fmt.Errorf("thaw source cgroup after tfork restore: %w", err)
 	}
-	sourceThawed = true
+	if err := tforkInjectFault("after_thaw"); err != nil {
+		return nil, err
+	}
+	srcPID, err := src.PID()
+	if err != nil {
+		return nil, fmt.Errorf("read source PID after restore: %w", err)
+	}
+	if err := tforkPIDRunning(srcPID); err != nil {
+		return nil, fmt.Errorf("source is not usable after tfork restore: %w", err)
+	}
 
 	srcCfg := src.Config()
 	if srcCfg == nil {
@@ -679,6 +716,10 @@ func (ic *ContainerEngine) containerCloneLive(ctx context.Context, opts entities
 		clonePID, err := readTforkClonePID(cloneID, imgDir, i, copies, useNcopyRestore)
 		if err != nil {
 			return nil, fmt.Errorf("read clone %d PID: %w", i, err)
+		}
+		txn.trackPID(clonePID, fmt.Sprintf("clone-init-%d", i))
+		if err := tforkPIDRunning(clonePID); err != nil {
+			return nil, fmt.Errorf("clone %d is not running before publication: %w", i, err)
 		}
 		cloneCfg, err := buildCloneContainerConfig(srcCfg, cloneID, cloneNames[i], cloneRootfsList[i], cloneSpecs[i])
 		if err != nil {
@@ -713,16 +754,17 @@ func (ic *ContainerEngine) containerCloneLive(ctx context.Context, opts entities
 		if err != nil {
 			return nil, fmt.Errorf("register clone %d (%s) in libpod state: %w", i, cloneID, err)
 		}
+		txn.addRegistered(ctr)
 		if opts.TforkOverlayBtrfs {
 			tforkFreezeUpperForRollback(bundleDir, i, copies)
 		}
 		if cloneConmonPids[i] > 0 {
 			if err := ctr.SetConmonPID(cloneConmonPids[i]); err != nil {
-				logrus.Warnf("tfork: clone %s SetConmonPID(%d): %v", cloneID, cloneConmonPids[i], err)
+				return nil, fmt.Errorf("clone %s SetConmonPID(%d): %w", cloneID, cloneConmonPids[i], err)
 			}
 		}
 		if err := ic.Libpod.SetupExternalCloneNetwork(src, ctr, clonePID); err != nil {
-			logrus.Warnf("tfork: clone %s network setup failed (clone has no network): %v", cloneID, err)
+			return nil, fmt.Errorf("clone %s network setup: %w", cloneID, err)
 		}
 		if cmd := exec.Command("nsenter",
 			"-t", strconv.Itoa(clonePID), "-n", "--",
@@ -733,17 +775,29 @@ func (ic *ContainerEngine) containerCloneLive(ctx context.Context, opts entities
 			}
 		}
 		if err := ctr.MoveExternalCloneToOwnCgroup(clonePID); err != nil {
-			logrus.Warnf("tfork: clone %s F8 cgroup migration failed: %v (clone shares source's cgroup)", cloneID, err)
+			return nil, fmt.Errorf("clone %s cgroup migration: %w", cloneID, err)
 		}
 		if cloneConmonPids[i] == 0 {
-			if err := spawnTforkExitWatcher(ctx, ic.Libpod, ctr, clonePID); err != nil {
-				logrus.Warnf("tfork: clone %s exit-watcher spawn: %v (podman will fall back to F4.2 /proc liveness check)", cloneID, err)
+			watcherPID, err := spawnTforkExitWatcher(ctx, ic.Libpod, ctr, clonePID)
+			if err != nil {
+				return nil, fmt.Errorf("tfork: clone %s exit-watcher spawn: %w", cloneID, err)
 			}
+			txn.trackPID(watcherPID, fmt.Sprintf("exit-watcher-%d", i))
+		}
+		if err := tforkPIDRunning(clonePID); err != nil {
+			return nil, fmt.Errorf("clone %d died during publication: %w", i, err)
+		}
+		if err := tforkInjectFault(fmt.Sprintf("after_register_%d", i)); err != nil {
+			return nil, err
 		}
 		logrus.Infof("tfork: clone %s (%s) registered in libpod state, pid=%d", cloneID, cloneNames[i], clonePID)
 		visibleCloneIDs = append(visibleCloneIDs, cloneID)
 	}
 
+	if err := tforkInjectFault("before_commit"); err != nil {
+		return nil, err
+	}
+	txn.commit()
 	return &entities.ContainerCreateReport{Id: strings.Join(visibleCloneIDs, "\n")}, nil
 }
 
@@ -944,23 +998,40 @@ func spawnTforkDumpdHolder() (int, uint64, error) {
 
 func tforkAbortCrunCmd(crunCmd *exec.Cmd, src *libpod.Container, bundleDir string, copies int) {
 	if crunCmd != nil && crunCmd.Process != nil {
-		toKill := tforkCollectDescendants(crunCmd.Process.Pid)
-		toKill = append(toKill, crunCmd.Process.Pid)
-		for _, pid := range toKill {
-			_ = syscall.Kill(pid, syscall.SIGKILL)
+		protected := make(map[int]bool)
+		if src != nil {
+			if srcPID, err := src.PID(); err == nil && srcPID > 0 {
+				protected[srcPID] = true
+				for _, pid := range tforkCollectDescendants(srcPID) {
+					protected[pid] = true
+				}
+			}
 		}
-		done := make(chan struct{})
-		go func() {
-			_, _ = crunCmd.Process.Wait()
-			close(done)
-		}()
-		select {
-		case <-done:
-		case <-time.After(3 * time.Second):
-			logrus.Warnf("tfork: crun-tfork didn't exit in 3s after SIGKILL — source may still be ptraced")
+		toKill := tforkCollectDescendants(crunCmd.Process.Pid)
+		// Give CRIU's service and restore helpers a chance to unwind ptrace,
+		// parasite, namespace, and cgyard state before killing their parent.
+		// Never signal a source-tree PID even if transient reparenting makes it
+		// appear below the runtime.
+		for i := len(toKill) - 1; i >= 0; i-- {
+			if !protected[toKill[i]] {
+				_ = syscall.Kill(toKill[i], syscall.SIGTERM)
+			}
+		}
+		if !tforkWaitPIDGone(crunCmd.Process.Pid, time.Second) {
+			for i := len(toKill) - 1; i >= 0; i-- {
+				if !protected[toKill[i]] {
+					_ = syscall.Kill(toKill[i], syscall.SIGKILL)
+				}
+			}
+			_ = syscall.Kill(crunCmd.Process.Pid, syscall.SIGKILL)
+			if !tforkWaitPIDGone(crunCmd.Process.Pid, 3*time.Second) {
+				logrus.Warnf("tfork: crun-tfork didn't exit after TERM/KILL escalation — source may still be ptraced")
+			}
 		}
 		for _, pid := range tforkCollectDescendants(crunCmd.Process.Pid) {
-			_ = syscall.Kill(pid, syscall.SIGKILL)
+			if !protected[pid] {
+				_ = syscall.Kill(pid, syscall.SIGKILL)
+			}
 		}
 	}
 	if src != nil {
@@ -977,6 +1048,19 @@ func tforkAbortCrunCmd(crunCmd *exec.Cmd, src *libpod.Container, bundleDir strin
 	}
 	if bundleDir != "" {
 		tforkBestEffortBundleReap(bundleDir, copies)
+	}
+}
+
+func tforkWaitPIDGone(pid int, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for {
+		if err := syscall.Kill(pid, 0); errors.Is(err, syscall.ESRCH) {
+			return true
+		}
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 }
 
@@ -1118,9 +1202,9 @@ while True:
 	return nil
 }
 
-func spawnTforkStdioHelper(readEnd *os.File, attachSock *os.File, logPath string, tty bool) error {
+func spawnTforkStdioHelper(readEnd *os.File, attachSock *os.File, logPath string, tty bool) (int, error) {
 	if err := os.MkdirAll(filepath.Dir(logPath), 0o755); err != nil {
-		return fmt.Errorf("mkdir %s: %w", filepath.Dir(logPath), err)
+		return 0, fmt.Errorf("mkdir %s: %w", filepath.Dir(logPath), err)
 	}
 	pyCode := `import os, sys, asyncio, datetime, socket, io, traceback
 LOG_PATH = os.environ["LOG_PATH"]
@@ -1240,13 +1324,15 @@ except Exception:
 	env = append(env, fmt.Sprintf("ATTACH_FD=%d", attachFD))
 	cmd.Env = env
 	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("start stdio-helper: %w", err)
+		return 0, fmt.Errorf("start stdio-helper: %w", err)
 	}
+	pid := 0
 	if cmd.Process != nil {
+		pid = cmd.Process.Pid
 		_ = cmd.Process.Release()
 	}
 	logrus.Debugf("tfork: spawned stdio-helper for read-fd → %s (attach=%v, tty=%v)", logPath, attachSock != nil, tty)
-	return nil
+	return pid, nil
 }
 
 func boolToInt(b bool) int {
@@ -1280,10 +1366,10 @@ func allocPerCopyAttachSocket(path string) (*os.File, error) {
 	return f, nil
 }
 
-func spawnTforkExitWatcher(ctx context.Context, rt *libpod.Runtime, ctr *libpod.Container, clonePID int) error {
+func spawnTforkExitWatcher(ctx context.Context, rt *libpod.Runtime, ctr *libpod.Container, clonePID int) (int, error) {
 	exitDir := "/run/libpod/exits"
 	if err := os.MkdirAll(exitDir, 0o755); err != nil {
-		return fmt.Errorf("mkdir %s: %w", exitDir, err)
+		return 0, fmt.Errorf("mkdir %s: %w", exitDir, err)
 	}
 	exitFile := filepath.Join(exitDir, ctr.ID())
 	script := fmt.Sprintf(`while [ -d /proc/%d ]; do sleep 0.2; done; tmp=%s.tmp; printf 137 > "$tmp" && mv "$tmp" %s`, clonePID, exitFile, exitFile)
@@ -1292,13 +1378,15 @@ func spawnTforkExitWatcher(ctx context.Context, rt *libpod.Runtime, ctr *libpod.
 	cmd.Stdout = nil
 	cmd.Stderr = nil
 	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("start exit-watcher: %w", err)
+		return 0, fmt.Errorf("start exit-watcher: %w", err)
 	}
+	pid := 0
 	if cmd.Process != nil {
+		pid = cmd.Process.Pid
 		_ = cmd.Process.Release()
 	}
 	logrus.Debugf("tfork: spawned exit-watcher for clone %s (PID %d) → %s", ctr.ID(), clonePID, exitFile)
-	return nil
+	return pid, nil
 }
 
 func readTforkClonePID(cloneID string, imgDir string, copyIdx, copies int, useNcopyRestore bool) (int, error) {
