@@ -60,6 +60,7 @@ trap cleanup EXIT
 
 btrfs subvolume create "$source_subvol" >/dev/null
 printf 'filecow-layer-lifetime\n' >"$source_subvol/cached"
+dd if=/dev/zero bs=4096 count=16 status=none >>"$source_subvol/cached"
 : >"$source_subvol/empty"
 sync -f "$source_subvol/cached"
 
@@ -76,7 +77,7 @@ reused_before="$(stat_value fork_reused_layer)"
 
 for ((i = 0; i < LOOPS; i++)); do
 	btrfs subvolume snapshot "$source_subvol" "$child_subvol" >/dev/null
-	[[ "$(cat "$child_subvol/cached")" == filecow-layer-lifetime ]] ||
+	[[ "$(head -n 1 "$child_subvol/cached")" == filecow-layer-lifetime ]] ||
 		fail "snapshot data mismatch in iteration $i"
 	stat "$child_subvol/empty" >/dev/null
 	btrfs subvolume delete "$child_subvol" >/dev/null

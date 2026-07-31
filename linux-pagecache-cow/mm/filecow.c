@@ -925,20 +925,25 @@ EXPORT_SYMBOL_GPL(filecow_aggressive_evict);
  * The caller holds the mapping invalidate lock for write.  The XArray lock
  * closes the remaining race with reclaim while the frozen source is inspected.
  */
-static bool filecow_mapping_has_private_state(struct address_space *mapping)
+static bool filecow_mapping_has_private_state(struct address_space *mapping,
+					       bool *has_tombstone)
 {
 	struct folio *folio;
 	bool has_private = false;
 	XA_STATE(xas, &mapping->i_pages, 0);
 
+	*has_tombstone = false;
 	xas_lock_irq(&xas);
 	xas_for_each(&xas, folio, ULONG_MAX) {
 		if (xas_retry(&xas, folio))
 			continue;
-		if (xa_is_tombstone(folio) ||
-		    (!xa_is_value(folio) && !folio_test_filecow(folio))) {
+		if (xa_is_tombstone(folio)) {
+			*has_tombstone = true;
 			has_private = true;
-			break;
+			continue;
+		}
+		if (!xa_is_value(folio) && !folio_test_filecow(folio)) {
+			has_private = true;
 		}
 	}
 	xas_unlock_irq(&xas);
@@ -954,7 +959,9 @@ int address_space_fork(struct address_space *new, struct address_space *source)
 	unsigned long *share_bitmap = NULL;
 	int n = 0, capacity, i, moved = 0;
 	int ret = 0;
+	bool any_shareable = false;
 	bool has_private_state;
+	bool has_tombstone;
 	XA_STATE(xas, &source->i_pages, 0);
 
 	if (!READ_ONCE(sysctl_filecow_enabled))
@@ -995,7 +1002,8 @@ int address_space_fork(struct address_space *new, struct address_space *source)
 		ret = -EBUSY;
 		goto out_unlock;
 	}
-	has_private_state = filecow_mapping_has_private_state(source);
+	has_private_state = filecow_mapping_has_private_state(source,
+							      &has_tombstone);
 
 	/*
 	 * A clean mapping without a filecow layer has no in-memory state to
@@ -1025,10 +1033,89 @@ int address_space_fork(struct address_space *new, struct address_space *source)
 		goto out_unlock;
 	}
 
+	capacity = source->nrpages;
+	if (capacity != 0) {
+		batch = kvmalloc_array(capacity, sizeof(*batch),
+				      GFP_KERNEL | __GFP_NOWARN);
+		indices = kvmalloc_array(capacity, sizeof(*indices),
+					GFP_KERNEL | __GFP_NOWARN);
+		if (!batch || !indices) {
+			ret = -ENOMEM;
+			goto out_free_arrays;
+		}
+
+		xas_lock_irq(&xas);
+		xas_for_each(&xas, folio, ULONG_MAX) {
+			if (n >= capacity)
+				break;
+			if (xas_retry(&xas, folio))
+				continue;
+			if (xa_is_value(folio))
+				continue;
+			if (folio_test_large(folio)) {
+				atomic_long_inc(&filecow_stat_large_seen);
+				atomic_long_add(folio_nr_pages(folio),
+						&filecow_stat_large_skipped);
+				continue;
+			}
+
+			if (folio_test_filecow(folio))
+				continue;
+			batch[n] = folio;
+			indices[n] = xas.xa_index;
+			n++;
+		}
+		xas_unlock_irq(&xas);
+
+		share_bitmap = kvmalloc(BITS_TO_LONGS(n) * sizeof(long),
+					GFP_KERNEL | __GFP_ZERO);
+		if (share_bitmap && source->a_ops &&
+		    source->a_ops->folio_extents_shared_bulk) {
+			source->a_ops->folio_extents_shared_bulk(
+				source, new, indices, n, share_bitmap);
+			atomic_long_inc(&filecow_stat_bulk_hook_used);
+			any_shareable = !bitmap_empty(share_bitmap, n);
+		} else {
+			atomic_long_inc(&filecow_stat_perfolio_hook_used);
+			for (i = 0; i < n; i++) {
+				if (!can_share_folio(batch[i], source, new))
+					continue;
+				any_shareable = true;
+				if (share_bitmap)
+					__set_bit(i, share_bitmap);
+			}
+		}
+	}
+
+	/*
+	 * Ordinary cached folios whose extents are not shared with the snapshot
+	 * must remain private to the source.  The snapshot already has their
+	 * correct on-disk contents, so an empty filecow generation would retain
+	 * memory without preserving any state.
+	 */
+	if (!has_tombstone && !any_shareable) {
+		kvfree(share_bitmap);
+		kvfree(batch);
+		kvfree(indices);
+		if (!source->ro) {
+			atomic_long_inc(&filecow_stat_fork_no_layer);
+			goto out_unlock;
+		}
+
+		L = source->ro;
+		spin_lock(&L->sharers_lock);
+		refcount_inc(&L->refs);
+		new->ro = L;
+		list_add(&new->filecow_link, &L->sharers);
+		spin_unlock(&L->sharers_lock);
+		atomic_long_inc(&filecow_stat_fork_reused_layer);
+		goto out_unlock;
+	}
+
 	L = filecow_layer_alloc(source);
 	if (!L) {
 		ret = -ENOMEM;
-		goto out_unlock;
+		goto out_free_arrays;
 	}
 	L->below = source->ro;
 	if (source->ro) {
@@ -1044,6 +1131,7 @@ int address_space_fork(struct address_space *new, struct address_space *source)
 			list_for_each_entry(next_as, &L_old->sharers,
 					    filecow_link) {
 				struct inode *cand = next_as->host;
+
 				if (cand && !(inode_state_read_once(cand) &
 					     (I_FREEING | I_WILL_FREE | I_CLEAR))) {
 					new_primary = cand;
@@ -1054,54 +1142,6 @@ int address_space_fork(struct address_space *new, struct address_space *source)
 		}
 		spin_unlock(&L_old->sharers_lock);
 	}
-	capacity = source->nrpages;
-	if (capacity == 0)
-		goto install;
-
-	batch = kvmalloc_array(capacity, sizeof(*batch),
-			       GFP_KERNEL | __GFP_NOWARN);
-	indices = kvmalloc_array(capacity, sizeof(*indices),
-				 GFP_KERNEL | __GFP_NOWARN);
-	if (!batch || !indices) {
-		ret = -ENOMEM;
-		goto out_free_layer;
-	}
-
-	xas_lock_irq(&xas);
-	xas_for_each(&xas, folio, ULONG_MAX) {
-		if (n >= capacity)
-			break;
-		if (xas_retry(&xas, folio))
-			continue;
-		if (xa_is_value(folio))
-			continue;
-		if (folio_test_large(folio)) {
-			atomic_long_inc(&filecow_stat_large_seen);
-			atomic_long_add(folio_nr_pages(folio),
-					&filecow_stat_large_skipped);
-			continue;
-		}
-
-		if (folio_test_filecow(folio))
-			continue;
-		batch[n] = folio;
-		indices[n] = xas.xa_index;
-		n++;
-	}
-	xas_unlock_irq(&xas);
-
-	if (n > 0 && source->a_ops &&
-	    source->a_ops->folio_extents_shared_bulk) {
-		share_bitmap = kvmalloc(BITS_TO_LONGS(n) * sizeof(long),
-					GFP_KERNEL | __GFP_ZERO);
-		if (share_bitmap) {
-			source->a_ops->folio_extents_shared_bulk(
-				source, new, indices, n, share_bitmap);
-			atomic_long_inc(&filecow_stat_bulk_hook_used);
-		}
-	}
-	if (!share_bitmap)
-		atomic_long_inc(&filecow_stat_perfolio_hook_used);
 
 	for (i = 0; i < n; i++) {
 		void *prev;
@@ -1164,16 +1204,8 @@ install:
 	}
 	return 0;
 
-out_free_layer:
-	if (L->below) {
-		spin_lock(&L->below->sharers_lock);
-		list_add(&source->filecow_link, &L->below->sharers);
-		spin_unlock(&L->below->sharers_lock);
-	}
-
-	atomic_long_inc(&filecow_stat_layers_freed);
-	atomic_long_dec(&filecow_stat_layers_active);
-	kmem_cache_free(filecow_layer_cache, L);
+out_free_arrays:
+	kvfree(share_bitmap);
 	kvfree(batch);
 	kvfree(indices);
 out_unlock:
