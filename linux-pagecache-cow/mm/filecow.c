@@ -922,8 +922,11 @@ EXPORT_SYMBOL_GPL(filecow_aggressive_evict);
  * values are reclaim metadata.  A tombstone or a normal folio, however,
  * changes what a descendant must observe.
  *
- * The caller holds the mapping invalidate lock for write.  The XArray lock
- * closes the remaining race with reclaim while the frozen source is inspected.
+ * The caller holds the mapping invalidate lock for write.  Together with the
+ * frozen source, this excludes fault, write, and truncate paths which could add
+ * private state.  Reclaim can still replace an origin folio with a tombstone,
+ * so the population scan refreshes has_tombstone under the XArray lock before
+ * taking the no-new-layer fast path.
  */
 static bool filecow_mapping_has_private_state(struct address_space *mapping,
 					      bool *has_tombstone)
@@ -1045,10 +1048,13 @@ int address_space_fork(struct address_space *new, struct address_space *source)
 
 		xas_lock_irq(&xas);
 		xas_for_each(&xas, folio, ULONG_MAX) {
-			if (n >= capacity)
-				break;
 			if (xas_retry(&xas, folio))
 				continue;
+			if (xa_is_tombstone(folio)) {
+				has_private_state = true;
+				has_tombstone = true;
+				continue;
+			}
 			if (xa_is_value(folio))
 				continue;
 			if (folio_test_large(folio)) {
@@ -1060,29 +1066,40 @@ int address_space_fork(struct address_space *new, struct address_space *source)
 
 			if (folio_test_filecow(folio))
 				continue;
+			if (WARN_ON_ONCE(n >= capacity))
+				continue;
 			batch[n] = folio;
 			indices[n] = xas.xa_index;
 			n++;
 		}
 		xas_unlock_irq(&xas);
 
-		share_bitmap = kvmalloc_array(BITS_TO_LONGS(n), sizeof(long),
-					      GFP_KERNEL | __GFP_ZERO);
-		if (share_bitmap && source->a_ops &&
-		    source->a_ops->folio_extents_shared_bulk) {
-			source->a_ops->folio_extents_shared_bulk(source, new,
-								 indices, n,
-								 share_bitmap);
-			atomic_long_inc(&filecow_stat_bulk_hook_used);
-			any_shareable = !bitmap_empty(share_bitmap, n);
-		} else {
-			atomic_long_inc(&filecow_stat_perfolio_hook_used);
-			for (i = 0; i < n; i++) {
-				if (!can_share_folio(batch[i], source, new))
-					continue;
+		if (n > 0) {
+			share_bitmap = kvmalloc_array(BITS_TO_LONGS(n),
+						      sizeof(long),
+						      GFP_KERNEL | __GFP_ZERO);
+			if (!share_bitmap) {
+				/*
+				 * Keep a generation under memory pressure.  The
+				 * population loop will check each folio once without
+				 * a result bitmap.
+				 */
+				atomic_long_inc(&filecow_stat_perfolio_hook_used);
 				any_shareable = true;
-				if (share_bitmap)
+			} else if (source->a_ops &&
+				   source->a_ops->folio_extents_shared_bulk) {
+				source->a_ops->folio_extents_shared_bulk(
+					source, new, indices, n, share_bitmap);
+				atomic_long_inc(&filecow_stat_bulk_hook_used);
+				any_shareable = !bitmap_empty(share_bitmap, n);
+			} else {
+				atomic_long_inc(&filecow_stat_perfolio_hook_used);
+				for (i = 0; i < n; i++) {
+					if (!can_share_folio(batch[i], source, new))
+						continue;
+					any_shareable = true;
 					__set_bit(i, share_bitmap);
+				}
 			}
 		}
 	}
