@@ -1088,8 +1088,9 @@ int address_space_fork(struct address_space *new, struct address_space *source)
 				any_shareable = true;
 			} else if (source->a_ops &&
 				   source->a_ops->folio_extents_shared_bulk) {
-				source->a_ops->folio_extents_shared_bulk(
-					source, new, indices, n, share_bitmap);
+				source->a_ops->folio_extents_shared_bulk(source, new,
+								 indices, n,
+								 share_bitmap);
 				atomic_long_inc(&filecow_stat_bulk_hook_used);
 				any_shareable = !bitmap_empty(share_bitmap, n);
 			} else {
