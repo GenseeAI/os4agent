@@ -503,18 +503,19 @@ type ContainerCloneOptions struct {
 	Run          bool
 	Force        bool
 
-	Live              bool
-	Copies            int
-	Persistent        string
-	WithPrevious      bool
-	SharedUsr         bool
-	TforkGhostLimit   uint
-	TforkTCPClose     bool
-	TforkFullMemcopy  bool
-	TforkNetworkLock  string
-	TforkOverlayBtrfs bool
-	TforkMetadata     bool
-	TforkInjectFiles  []string
+	Live                   bool
+	Copies                 int
+	Persistent             string
+	WithPrevious           bool
+	SharedUsr              bool
+	TforkGhostLimit        uint
+	TforkTCPClose          bool
+	TforkFullMemcopy       bool
+	TforkNetworkLock       string
+	TforkOverlayBtrfs      bool
+	TforkMetadata          bool
+	TforkInjectFiles       []string
+	TforkInjectSourceFiles []string
 }
 
 // ContainerUpdateOptions containers options for updating an existing containers cgroup configuration

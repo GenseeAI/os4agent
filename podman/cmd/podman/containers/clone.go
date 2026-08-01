@@ -67,6 +67,9 @@ func cloneFlags(cmd *cobra.Command) {
 	tforkInjectFileFlagName := "tfork-inject-file"
 	flags.StringSliceVar(&ctrClone.TforkInjectFiles, tforkInjectFileFlagName, nil, "inject COPY_INDEX:HOST_PATH:CONTAINER_PATH after live restore and before publication")
 
+	tforkInjectSourceFileFlagName := "tfork-inject-source-file"
+	flags.StringSliceVar(&ctrClone.TforkInjectSourceFiles, tforkInjectSourceFileFlagName, nil, "inject HOST_PATH:CONTAINER_PATH into the frozen source after rootfs cloning")
+
 	tforkGhostLimitFlagName := "tfork-ghost-limit"
 	flags.UintVar(&ctrClone.TforkGhostLimit, tforkGhostLimitFlagName, 256<<20, "raise CRIU's ghost-file size cap (bytes); GUI apps need >1MiB default (only with --live)")
 
@@ -156,6 +159,9 @@ func clone(cmd *cobra.Command, args []string) error {
 		}
 		if len(ctrClone.TforkInjectFiles) > 0 {
 			return fmt.Errorf("--tfork-inject-file requires --live: %w", define.ErrInvalidArg)
+		}
+		if len(ctrClone.TforkInjectSourceFiles) > 0 {
+			return fmt.Errorf("--tfork-inject-source-file requires --live: %w", define.ErrInvalidArg)
 		}
 	}
 

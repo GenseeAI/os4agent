@@ -130,6 +130,10 @@ func (ic *ContainerEngine) containerCloneLive(ctx context.Context, opts entities
 	if err != nil {
 		return nil, err
 	}
+	sourceFileInjections, err := tforkParseSourceFileInjections(opts.TforkInjectSourceFiles)
+	if err != nil {
+		return nil, err
+	}
 	useSingleCopyConmon := requestedCopies == 1 && os.Getenv("PODMAN_TFORK_SINGLE_COPY_CONMON") == "1"
 	// PODMAN_TFORK_SINGLE_COPY_DIRECT is a debugging escape hatch that skips
 	// the n-copy restore helper for single-copy experiments. Production paths
@@ -267,6 +271,17 @@ func (ic *ContainerEngine) containerCloneLive(ctx context.Context, opts entities
 				}
 			} else if rerr != nil {
 				logrus.Warnf("tfork: read source resolv.conf %s: %v", srcResolv, rerr)
+			}
+		}
+	}
+	if len(sourceFileInjections) > 0 {
+		srcPID, err := src.PID()
+		if err != nil {
+			return nil, fmt.Errorf("read frozen source PID for file injection: %w", err)
+		}
+		for _, injection := range sourceFileInjections {
+			if err := tforkInjectFileIntoProcessRoot(srcPID, injection); err != nil {
+				return nil, fmt.Errorf("inject file into frozen source: %w", err)
 			}
 		}
 	}
@@ -1050,6 +1065,26 @@ func tforkParseFileInjections(specs []string, copies int) (map[int][]tforkFileIn
 			source:      source,
 			destination: destination,
 		})
+	}
+	return parsed, nil
+}
+
+func tforkParseSourceFileInjections(specs []string) ([]tforkFileInjection, error) {
+	parsed := make([]tforkFileInjection, 0, len(specs))
+	for _, spec := range specs {
+		parts := strings.SplitN(spec, ":", 2)
+		if len(parts) != 2 {
+			return nil, fmt.Errorf("invalid --tfork-inject-source-file %q (expected HOST_PATH:CONTAINER_PATH)", spec)
+		}
+		source := filepath.Clean(parts[0])
+		destination := filepath.Clean(parts[1])
+		if !filepath.IsAbs(source) || source == string(os.PathSeparator) {
+			return nil, fmt.Errorf("tfork source injection source must be a non-root absolute path: %q", parts[0])
+		}
+		if !filepath.IsAbs(destination) || destination == string(os.PathSeparator) {
+			return nil, fmt.Errorf("tfork source injection destination must be a non-root absolute path: %q", parts[1])
+		}
+		parsed = append(parsed, tforkFileInjection{source: source, destination: destination})
 	}
 	return parsed, nil
 }

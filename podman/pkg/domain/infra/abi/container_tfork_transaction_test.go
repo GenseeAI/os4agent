@@ -65,6 +65,21 @@ func TestTforkParseFileInjections(t *testing.T) {
 	}
 }
 
+func TestTforkParseSourceFileInjections(t *testing.T) {
+	parsed, err := tforkParseSourceFileInjections([]string{
+		"/tmp/source.json:/tmp/gensee-run-context.json",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(parsed) != 1 || parsed[0].source != "/tmp/source.json" || parsed[0].destination != "/tmp/gensee-run-context.json" {
+		t.Fatalf("unexpected source file injections: %#v", parsed)
+	}
+	if _, err := tforkParseSourceFileInjections([]string{"relative:/tmp/context"}); err == nil {
+		t.Fatal("expected relative source path to fail")
+	}
+}
+
 func TestTforkTransactionRollbackIsIdempotent(t *testing.T) {
 	temp := t.TempDir()
 	bundle := filepath.Join(temp, "graph", "tfork-bundles", "batch")
