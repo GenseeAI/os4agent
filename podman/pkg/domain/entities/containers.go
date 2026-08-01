@@ -514,6 +514,7 @@ type ContainerCloneOptions struct {
 	TforkNetworkLock  string
 	TforkOverlayBtrfs bool
 	TforkMetadata     bool
+	TforkInjectFiles  []string
 }
 
 // ContainerUpdateOptions containers options for updating an existing containers cgroup configuration

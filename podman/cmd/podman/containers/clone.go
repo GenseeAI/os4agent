@@ -64,6 +64,9 @@ func cloneFlags(cmd *cobra.Command) {
 	tforkMetadataFlagName := "tfork-metadata"
 	flags.BoolVar(&ctrClone.TforkMetadata, tforkMetadataFlagName, false, "print live-clone identity, PID, and rootfs metadata as JSON (only with --live)")
 
+	tforkInjectFileFlagName := "tfork-inject-file"
+	flags.StringSliceVar(&ctrClone.TforkInjectFiles, tforkInjectFileFlagName, nil, "inject COPY_INDEX:HOST_PATH:CONTAINER_PATH after live restore and before publication")
+
 	tforkGhostLimitFlagName := "tfork-ghost-limit"
 	flags.UintVar(&ctrClone.TforkGhostLimit, tforkGhostLimitFlagName, 256<<20, "raise CRIU's ghost-file size cap (bytes); GUI apps need >1MiB default (only with --live)")
 
@@ -150,6 +153,9 @@ func clone(cmd *cobra.Command, args []string) error {
 		}
 		if ctrClone.TforkMetadata {
 			return fmt.Errorf("--tfork-metadata requires --live: %w", define.ErrInvalidArg)
+		}
+		if len(ctrClone.TforkInjectFiles) > 0 {
+			return fmt.Errorf("--tfork-inject-file requires --live: %w", define.ErrInvalidArg)
 		}
 	}
 

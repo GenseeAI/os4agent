@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/exec"
@@ -18,6 +19,7 @@ import (
 
 	"github.com/containers/podman/v5/libpod"
 	"github.com/containers/podman/v5/libpod/define"
+	"github.com/cyphar/filepath-securejoin/pathrs-lite"
 
 	"github.com/containers/podman/v5/pkg/domain/entities"
 	"github.com/containers/podman/v5/utils"
@@ -124,6 +126,10 @@ func (ic *ContainerEngine) containerCloneLive(ctx context.Context, opts entities
 		copies = 1
 	}
 	requestedCopies := copies
+	fileInjections, err := tforkParseFileInjections(opts.TforkInjectFiles, requestedCopies)
+	if err != nil {
+		return nil, err
+	}
 	useSingleCopyConmon := requestedCopies == 1 && os.Getenv("PODMAN_TFORK_SINGLE_COPY_CONMON") == "1"
 	// PODMAN_TFORK_SINGLE_COPY_DIRECT is a debugging escape hatch that skips
 	// the n-copy restore helper for single-copy experiments. Production paths
@@ -922,6 +928,11 @@ func (ic *ContainerEngine) containerCloneLive(ctx context.Context, opts entities
 		if err := tforkPIDRunning(clonePID); err != nil {
 			return nil, fmt.Errorf("clone %d is not running before publication: %w", i, err)
 		}
+		for _, injection := range fileInjections[i] {
+			if err := tforkInjectFileIntoProcessRoot(clonePID, injection); err != nil {
+				return nil, fmt.Errorf("inject clone %d file %s: %w", i, injection.destination, err)
+			}
+		}
 		cloneCfg, err := buildCloneContainerConfig(srcCfg, cloneID, cloneNames[i], cloneRootfsList[i], cloneSpecs[i])
 		if err != nil {
 			return nil, fmt.Errorf("build clone %d config: %w", i, err)
@@ -1009,6 +1020,80 @@ func (ic *ContainerEngine) containerCloneLive(ctx context.Context, opts entities
 		Id:          strings.Join(visibleCloneIDs, "\n"),
 		TforkClones: visibleClones,
 	}, nil
+}
+
+type tforkFileInjection struct {
+	source      string
+	destination string
+}
+
+func tforkParseFileInjections(specs []string, copies int) (map[int][]tforkFileInjection, error) {
+	parsed := make(map[int][]tforkFileInjection)
+	for _, spec := range specs {
+		parts := strings.SplitN(spec, ":", 3)
+		if len(parts) != 3 {
+			return nil, fmt.Errorf("invalid --tfork-inject-file %q (expected COPY_INDEX:HOST_PATH:CONTAINER_PATH)", spec)
+		}
+		copyIndex, err := strconv.Atoi(parts[0])
+		if err != nil || copyIndex < 0 || copyIndex >= copies {
+			return nil, fmt.Errorf("invalid --tfork-inject-file copy index %q for %d copies", parts[0], copies)
+		}
+		source := filepath.Clean(parts[1])
+		destination := filepath.Clean(parts[2])
+		if !filepath.IsAbs(source) || source == string(os.PathSeparator) {
+			return nil, fmt.Errorf("tfork injection source must be a non-root absolute path: %q", parts[1])
+		}
+		if !filepath.IsAbs(destination) || destination == string(os.PathSeparator) {
+			return nil, fmt.Errorf("tfork injection destination must be a non-root absolute path: %q", parts[2])
+		}
+		parsed[copyIndex] = append(parsed[copyIndex], tforkFileInjection{
+			source:      source,
+			destination: destination,
+		})
+	}
+	return parsed, nil
+}
+
+func tforkInjectFileIntoProcessRoot(pid int, injection tforkFileInjection) error {
+	const maximumInjectionSize = 1 << 20
+	sourceFD, err := unix.Open(injection.source, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	if err != nil {
+		return fmt.Errorf("open source %s: %w", injection.source, err)
+	}
+	source := os.NewFile(uintptr(sourceFD), injection.source)
+	defer source.Close()
+	info, err := source.Stat()
+	if err != nil {
+		return fmt.Errorf("stat source %s: %w", injection.source, err)
+	}
+	if !info.Mode().IsRegular() || info.Size() > maximumInjectionSize {
+		return fmt.Errorf("source must be a regular file no larger than %d bytes", maximumInjectionSize)
+	}
+
+	root := filepath.Join("/proc", strconv.Itoa(pid), "root")
+	parent, err := pathrs.OpenInRoot(root, filepath.Dir(injection.destination))
+	if err != nil {
+		return fmt.Errorf("open destination parent: %w", err)
+	}
+	defer parent.Close()
+	destinationFD, err := unix.Openat(
+		int(parent.Fd()),
+		filepath.Base(injection.destination),
+		unix.O_WRONLY|unix.O_CREAT|unix.O_TRUNC|unix.O_CLOEXEC|unix.O_NOFOLLOW,
+		0o600,
+	)
+	if err != nil {
+		return fmt.Errorf("open destination: %w", err)
+	}
+	destination := os.NewFile(uintptr(destinationFD), injection.destination)
+	defer destination.Close()
+	if err := destination.Chmod(0o600); err != nil {
+		return fmt.Errorf("chmod destination: %w", err)
+	}
+	if _, err := io.Copy(destination, source); err != nil {
+		return fmt.Errorf("copy payload: %w", err)
+	}
+	return nil
 }
 
 type tforkCgroupFreezer struct {

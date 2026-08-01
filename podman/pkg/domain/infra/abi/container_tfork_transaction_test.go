@@ -42,6 +42,29 @@ func TestTforkPIDRunning(t *testing.T) {
 	}
 }
 
+func TestTforkParseFileInjections(t *testing.T) {
+	parsed, err := tforkParseFileInjections([]string{
+		"0:/tmp/source-0:/tmp/context.json",
+		"1:/tmp/source-1:/run/context.json",
+	}, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := parsed[1][0].destination; got != "/run/context.json" {
+		t.Fatalf("destination = %q", got)
+	}
+	for _, spec := range []string{
+		"missing-fields",
+		"2:/tmp/source:/tmp/context",
+		"0:relative:/tmp/context",
+		"0:/tmp/source:relative",
+	} {
+		if _, err := tforkParseFileInjections([]string{spec}, 2); err == nil {
+			t.Fatalf("expected %q to fail", spec)
+		}
+	}
+}
+
 func TestTforkTransactionRollbackIsIdempotent(t *testing.T) {
 	temp := t.TempDir()
 	bundle := filepath.Join(temp, "graph", "tfork-bundles", "batch")
