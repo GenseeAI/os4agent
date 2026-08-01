@@ -238,7 +238,15 @@ type RestoreOptions struct {
 type RestoreReport = types.RestoreReport
 
 type ContainerCreateReport struct {
-	Id string
+	Id          string               `json:"Id"`
+	TforkClones []TforkCloneMetadata `json:"TforkClones,omitempty"`
+}
+
+type TforkCloneMetadata struct {
+	ID     string `json:"id"`
+	Name   string `json:"name"`
+	PID    int    `json:"pid"`
+	Rootfs string `json:"rootfs"`
 }
 
 // AttachOptions describes the cli and other values
@@ -505,6 +513,7 @@ type ContainerCloneOptions struct {
 	TforkFullMemcopy  bool
 	TforkNetworkLock  string
 	TforkOverlayBtrfs bool
+	TforkMetadata     bool
 }
 
 // ContainerUpdateOptions containers options for updating an existing containers cgroup configuration
