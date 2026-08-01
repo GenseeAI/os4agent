@@ -16,8 +16,10 @@ func TestCheckConmonRunningExternalClonePIDIdentity(t *testing.T) {
 
 	ctr := &Container{
 		config: &ContainerConfig{
-			ExternalSetup:         true,
-			TforkInitPIDStartTime: startTime,
+			ContainerMiscConfig: ContainerMiscConfig{
+				ExternalSetup:         true,
+				TforkInitPIDStartTime: startTime,
+			},
 		},
 		state: &ContainerState{PID: pid},
 	}
