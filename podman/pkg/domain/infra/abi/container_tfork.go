@@ -327,7 +327,6 @@ func (ic *ContainerEngine) containerCloneLive(ctx context.Context, opts entities
 				return nil, fmt.Errorf("mkdir clone cgroup %s: %w", cgFS, err)
 			}
 			cloneCgroupPaths[i] = cgRel
-			txn.setCgroupPaths(cloneCgroupPaths)
 		}
 	}
 	txn.setCgroupPaths(cloneCgroupPaths)
@@ -721,10 +720,15 @@ func (ic *ContainerEngine) containerCloneLive(ctx context.Context, opts entities
 		if err := tforkPIDRunning(clonePID); err != nil {
 			return nil, fmt.Errorf("clone %d is not running before publication: %w", i, err)
 		}
+		clonePIDStartTime, err := libpod.ReadProcStartTime(clonePID)
+		if err != nil {
+			return nil, fmt.Errorf("read clone %d PID start time: %w", i, err)
+		}
 		cloneCfg, err := buildCloneContainerConfig(srcCfg, cloneID, cloneNames[i], cloneRootfsList[i], cloneSpecs[i])
 		if err != nil {
 			return nil, fmt.Errorf("build clone %d config: %w", i, err)
 		}
+		cloneCfg.TforkInitPIDStartTime = clonePIDStartTime
 		if len(srcCfg.PortMappings) > 0 {
 			clonePorts, err := buildClonePortMappings(srcCfg.PortMappings)
 			if err != nil {

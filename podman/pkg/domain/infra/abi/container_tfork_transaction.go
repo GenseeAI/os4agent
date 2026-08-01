@@ -275,6 +275,9 @@ func tforkPIDRunning(pid int) error {
 }
 
 func tforkInjectFault(stage string) error {
+	// PODMAN_TFORK_FAULT_INJECT is an opt-in integration-test hook. Keeping
+	// the hook at transaction boundaries exercises the real rollback path;
+	// production calls take the unset fast path below without changing state.
 	want := strings.TrimSpace(os.Getenv("PODMAN_TFORK_FAULT_INJECT"))
 	if want == "" {
 		return nil

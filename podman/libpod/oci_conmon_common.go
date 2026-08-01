@@ -832,6 +832,18 @@ func (r *ConmonOCIRuntime) CheckConmonRunning(ctr *Container) (bool, error) {
 		// instead of conmon.  Their init PID, not a missing conmon PID, is the
 		// authoritative liveness signal.
 		if ctr.config.ExternalSetup && ctr.state.PID > 0 {
+			if expected := ctr.config.TforkInitPIDStartTime; expected != 0 {
+				current, err := ReadProcStartTime(ctr.state.PID)
+				if errors.Is(err, os.ErrNotExist) || errors.Is(err, unix.ESRCH) {
+					return false, nil
+				}
+				if err != nil {
+					return false, fmt.Errorf("reading external clone pid %d start time: %w", ctr.state.PID, err)
+				}
+				if current != expected {
+					return false, nil
+				}
+			}
 			if err := unix.Kill(ctr.state.PID, 0); err != nil {
 				if errors.Is(err, unix.ESRCH) {
 					return false, nil
