@@ -1103,7 +1103,7 @@ static int read_pstree_image(void)
 	return ret < 0 ? -1 : 0;
 }
 
-static int helper_get_free_pid(struct pstree_item *item)
+int pstree_get_free_pid(struct pstree_item *item)
 {
 	int pidns = item ? item->pid->leaf_ns_id : ALL_PID_NS_ID;
 
@@ -1161,7 +1161,7 @@ static int prepare_pstree_ids(pid_t pid)
 			}
 		}
 		if (leader->pid->state != TASK_UNDEF) {
-			helper_pid = helper_get_free_pid(item);
+			helper_pid = pstree_get_free_pid(item);
 			if (helper_pid < 0)
 				break;
 
