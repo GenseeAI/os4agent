@@ -72,15 +72,22 @@ static void tfork_parent_profile_init(void)
 static void tfork_parent_profile_mark(const char *mark)
 {
 	uint64_t now;
+	uint64_t delta = 0;
+	uint64_t elapsed = 0;
 
 	if (!tfork_parent_profile)
 		return;
 	now = tfork_parent_profile_now();
+	if (now >= tfork_parent_profile_last) {
+		delta = now - tfork_parent_profile_last;
+		tfork_parent_profile_last = now;
+	}
+	if (now >= tfork_parent_profile_origin)
+		elapsed = now - tfork_parent_profile_origin;
 	pr_info("tfork-profile: phase=B-parent mark=%s delta_us=%llu elapsed_us=%llu\n",
 		mark,
-		(unsigned long long)((now - tfork_parent_profile_last) / 1000ULL),
-		(unsigned long long)((now - tfork_parent_profile_origin) / 1000ULL));
-	tfork_parent_profile_last = now;
+		(unsigned long long)(delta / 1000ULL),
+		(unsigned long long)(elapsed / 1000ULL));
 }
 
 static int tfork_dup_inherited_vma_cherrypick(int env_fd)

@@ -1662,7 +1662,7 @@ static int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
 	struct mem_dump_ctl mdc;
 	unsigned long cflags;
 	uint64_t profile_task_started = tfork_profile_now();
-	uint64_t profile_started;
+	uint64_t profile_started = 0;
 
 	if (profile_task_started)
 		tfork_task_profile.task_count++;

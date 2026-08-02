@@ -143,21 +143,28 @@ static void tfork_restore_profile_init(void)
 	tfork_restore_profile_origin = tfork_restore_profile_now();
 	tfork_restore_profile_last = tfork_restore_profile_origin;
 	tfork_restore_wait_seq = 0;
-	pr_warn("tfork-profile: phase=B-restore mark=start pid=%d\n", getpid());
+	pr_info("tfork-profile: phase=B-restore mark=start pid=%d\n", getpid());
 }
 
 static void tfork_restore_profile_mark(const char *mark)
 {
 	uint64_t now;
+	uint64_t delta = 0;
+	uint64_t elapsed = 0;
 
 	if (!tfork_restore_profile)
 		return;
 	now = tfork_restore_profile_now();
-	pr_warn("tfork-profile: phase=B-restore mark=%s pid=%d delta_us=%llu elapsed_us=%llu\n",
+	if (now >= tfork_restore_profile_last) {
+		delta = now - tfork_restore_profile_last;
+		tfork_restore_profile_last = now;
+	}
+	if (now >= tfork_restore_profile_origin)
+		elapsed = now - tfork_restore_profile_origin;
+	pr_info("tfork-profile: phase=B-restore mark=%s pid=%d delta_us=%llu elapsed_us=%llu\n",
 		mark, getpid(),
-		(unsigned long long)((now - tfork_restore_profile_last) / 1000ULL),
-		(unsigned long long)((now - tfork_restore_profile_origin) / 1000ULL));
-	tfork_restore_profile_last = now;
+		(unsigned long long)(delta / 1000ULL),
+		(unsigned long long)(elapsed / 1000ULL));
 }
 
 #ifndef arch_export_unmap
@@ -305,12 +312,15 @@ static int __restore_wait_inprogress_tasks(int participants)
 
 	if (profile_started) {
 		uint64_t now = tfork_restore_profile_now();
+		uint64_t elapsed = 0;
 
-		pr_warn("tfork-profile: phase=B-wait seq=%u pid=%d stage=%d "
+		if (now >= profile_started)
+			elapsed = now - profile_started;
+		pr_info("tfork-profile: phase=B-wait seq=%u pid=%d stage=%d "
 			"participants=%d initial=%d final=%d duration_us=%llu\n",
 			profile_seq, getpid(), (int)futex_get(&task_entries->start),
 			participants, profile_initial, (int)futex_get(np),
-			(unsigned long long)((now - profile_started) / 1000ULL));
+			(unsigned long long)(elapsed / 1000ULL));
 	}
 
 	ret = (int)futex_get(np);
