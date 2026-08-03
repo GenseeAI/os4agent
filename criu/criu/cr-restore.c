@@ -1453,14 +1453,15 @@ static int set_next_pid(void *arg)
 	return 0;
 }
 
-static inline int fork_with_pid(struct pstree_item *item)
+static inline int fork_with_pid_mode(struct pstree_item *item, bool parallel_sibling)
 {
 	struct cr_clone_arg ca;
 	struct ns_id *pid_ns = NULL;
 	bool external_pidns = false;
+	bool last_pid_locked = false;
 	int ret = -1;
 	pid_t pid = localpid(item);
-	unsigned long strip;
+	unsigned long strip, syscall_clone_flags;
 
 	if (item->pid->state != TASK_HELPER) {
 		if (open_core(uid(item), &ca.core))
@@ -1561,7 +1562,15 @@ static inline int fork_with_pid(struct pstree_item *item)
 	pr_info("Forking task with %d(%d) (flags 0x%lx)\n", realpid(item), pid, ca.clone_flags);
 
 	if (!(ca.clone_flags & CLONE_NEWPID)) {
-		lock_last_pid();
+		/*
+		 * clone3(set_tid) reserves the requested PID atomically. Parallel
+		 * sibling helpers must not serialize on the legacy ns_last_pid lock;
+		 * the lock remains mandatory for the fallback set_next_pid path.
+		 */
+		if (!parallel_sibling || !kdat.has_clone3_set_tid) {
+			lock_last_pid();
+			last_pid_locked = true;
+		}
 
 		if (!kdat.has_clone3_set_tid) {
 			if (external_pidns) {
@@ -1592,16 +1601,19 @@ static inline int fork_with_pid(struct pstree_item *item)
 	strip = CLONE_NEWNET | CLONE_NEWCGROUP | CLONE_NEWTIME;
 	if (!(item == root_item && is_simple_userns_tree()))
 		strip |= CLONE_NEWUSER;
+	syscall_clone_flags = ca.clone_flags;
+	if (parallel_sibling)
+		syscall_clone_flags |= CLONE_PARENT;
 
 	if (kdat.has_clone3_set_tid) {
-		if (opts.tfork.active && (ca.clone_flags & CLONE_NEWPID)) {
+		if (opts.tfork.active && (syscall_clone_flags & CLONE_NEWPID)) {
 			pr_info("tfork: restore pidns init uid=%d local pid %d with fresh parent pid, dumped chain level=%d\n",
 				uid(item), pid, item->pid->ns_level);
 			ret = clone3_with_pid_noasan(restore_task_with_children, &ca,
-						     ca.clone_flags & ~strip, SIGCHLD, pid);
+						     syscall_clone_flags & ~strip, SIGCHLD, pid);
 		} else if (item->pid->ns_level == 1)
 			ret = clone3_with_pid_noasan(restore_task_with_children, &ca,
-						     ca.clone_flags & ~strip, SIGCHLD, pid);
+						     syscall_clone_flags & ~strip, SIGCHLD, pid);
 		else {
 			struct pid tfork_pid = {};
 			struct pid *restore_pid = item->pid;
@@ -1630,7 +1642,7 @@ static inline int fork_with_pid(struct pstree_item *item)
 					restore_pid->ns_level);
 			}
 			ret = clone3_with_nested_pid_noasan(restore_task_with_children, &ca,
-							    ca.clone_flags & ~strip,
+							    syscall_clone_flags & ~strip,
 							    SIGCHLD, restore_pid);
 		}
 	} else {
@@ -1667,12 +1679,17 @@ static inline int fork_with_pid(struct pstree_item *item)
 	arch_shstk_unlock(item, ca.core, ret);
 
 err_unlock:
-	if (!(ca.clone_flags & CLONE_NEWPID))
+	if (last_pid_locked)
 		unlock_last_pid();
 
 	if (ca.core)
 		core_entry__free_unpacked(ca.core, NULL);
 	return ret;
+}
+
+static inline int fork_with_pid(struct pstree_item *item)
+{
+	return fork_with_pid_mode(item, false);
 }
 
 static pid_t userns_maps_helper_pid = -1;
@@ -1944,6 +1961,161 @@ static int mount_proc(void)
 	return ret;
 }
 
+#define TFORK_PARALLEL_SIBLING_MAX_WORKERS 16
+#define TFORK_PARALLEL_SIBLING_MIN_CHILDREN 32
+
+struct tfork_parallel_sibling_arg {
+	int worker_index;
+	int worker_count;
+	bool before_setsid;
+};
+
+static int tfork_parallel_sibling_worker_count(void)
+{
+	const char *value;
+	char *end = NULL;
+	long workers;
+
+	/*
+	 * Restrict the prototype to one bounded helper pool for root children.
+	 * Recursing into every wide subtree can multiply helpers without bound.
+	 */
+	if (!opts.tfork.active || current != root_item)
+		return 0;
+	value = getenv("CRIU_TFORK_PARALLEL_SIBLINGS");
+	if (!value || !value[0])
+		return 0;
+	workers = strtol(value, &end, 10);
+	if (!*end && workers == 0)
+		return 0;
+	if (*end || workers < 2) {
+		pr_warn("tfork: ignoring invalid CRIU_TFORK_PARALLEL_SIBLINGS=%s\n", value);
+		return 0;
+	}
+	if (workers > TFORK_PARALLEL_SIBLING_MAX_WORKERS)
+		workers = TFORK_PARALLEL_SIBLING_MAX_WORKERS;
+	return workers;
+}
+
+static bool tfork_parallel_sibling_matches(struct pstree_item *child, bool before_setsid)
+{
+	return restore_before_setsid(child) == before_setsid;
+}
+
+static int tfork_parallel_sibling_main(void *opaque)
+{
+	struct tfork_parallel_sibling_arg *arg = opaque;
+	struct pstree_item *child;
+	sigset_t unblock;
+	int ordinal = 0;
+
+	/* The root blocks SIGCHLD while it owns/reaps the temporary helpers. */
+	sigemptyset(&unblock);
+	sigaddset(&unblock, SIGCHLD);
+	if (sigprocmask(SIG_UNBLOCK, &unblock, NULL)) {
+		pr_perror("tfork: parallel sibling helper cannot unblock SIGCHLD");
+		return 1;
+	}
+
+	list_for_each_entry(child, &current->children, sibling) {
+		if (!tfork_parallel_sibling_matches(child, arg->before_setsid))
+			continue;
+		if ((ordinal++ % arg->worker_count) != arg->worker_index)
+			continue;
+		if (arg->before_setsid)
+			BUG_ON(child->born_sid != -1 && getsid(0) != child->born_sid);
+		if (fork_with_pid_mode(child, true) < 0)
+			return 1;
+	}
+	return 0;
+}
+
+/*
+ * Return 0 when the matching children were created, 1 when the guarded path
+ * is ineligible (the caller should use the serial loop), and -1 after a
+ * partial/failed parallel attempt.
+ */
+static int tfork_create_siblings_parallel(bool before_setsid, int requested_workers)
+{
+	struct tfork_parallel_sibling_arg args[TFORK_PARALLEL_SIBLING_MAX_WORKERS];
+	pid_t helpers[TFORK_PARALLEL_SIBLING_MAX_WORKERS] = {};
+	struct pstree_item *child;
+	sigset_t oldmask;
+	int child_count = 0, workers, launched = 0, i, ret = -1;
+
+	if (!kdat.has_clone3_set_tid)
+		return 1;
+
+	list_for_each_entry(child, &current->children, sibling) {
+		if (!tfork_parallel_sibling_matches(child, before_setsid))
+			continue;
+		child_count++;
+		/*
+		 * CLONE_PARENT is added only to the helper's clone3 syscall so
+		 * that the restored child remains a child of current. Nested PID
+		 * namespace creation and pre-existing CLONE_PARENT semantics need
+		 * a separate dependency proof and stay on the serial path.
+		 */
+		if (rsti(child)->clone_flags & (CLONE_PARENT | CLONE_NEWPID | CLONE_VM | CLONE_THREAD))
+			return 1;
+	}
+	/* Keep small process trees on the cheaper and better-tested serial path. */
+	if (child_count < TFORK_PARALLEL_SIBLING_MIN_CHILDREN)
+		return 1;
+
+	workers = requested_workers;
+	if (workers > child_count)
+		workers = child_count;
+	if (workers > TFORK_PARALLEL_SIBLING_MAX_WORKERS)
+		workers = TFORK_PARALLEL_SIBLING_MAX_WORKERS;
+
+	if (block_sigmask(&oldmask, SIGCHLD))
+		return -1;
+
+	pr_info("tfork: creating %d %s-setsid siblings with %d temporary helpers\n",
+		child_count, before_setsid ? "pre" : "post", workers);
+	for (i = 0; i < workers; i++) {
+		pid_t helper_pid = pstree_get_free_pid(current);
+
+		args[i].worker_index = i;
+		args[i].worker_count = workers;
+		args[i].before_setsid = before_setsid;
+		helpers[i] = clone3_with_pid_noasan(tfork_parallel_sibling_main, &args[i],
+						       0, SIGCHLD, helper_pid);
+		if (helpers[i] < 0) {
+			pr_perror("tfork: cannot create parallel sibling helper at vpid %d", helper_pid);
+			goto kill_helpers;
+		}
+		launched++;
+	}
+
+	ret = 0;
+	for (i = 0; i < launched; i++) {
+		int status = 0;
+		pid_t waited;
+
+		do {
+			waited = waitpid(helpers[i], &status, 0);
+		} while (waited < 0 && errno == EINTR);
+		if (waited != helpers[i] || !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+			pr_err("tfork: parallel sibling helper %d failed (waited=%d status=0x%x)\n",
+			       helpers[i], waited, status);
+			ret = -1;
+		}
+	}
+	if (restore_sigmask(&oldmask))
+		ret = -1;
+	return ret;
+
+kill_helpers:
+	for (i = 0; i < launched; i++)
+		kill(helpers[i], SIGKILL);
+	for (i = 0; i < launched; i++)
+		waitpid(helpers[i], NULL, 0);
+	restore_sigmask(&oldmask);
+	return -1;
+}
+
 /*
  * Tasks cannot change sid (session id) arbitrary, but can either
  * inherit one from ancestor, or create a new one with id equal to
@@ -1954,30 +2126,43 @@ static int create_children_and_session(void)
 {
 	int ret;
 	struct pstree_item *child;
+	int parallel_workers = tfork_parallel_sibling_worker_count();
 
 	pr_info("Restoring children in alien sessions:\n");
-	list_for_each_entry(child, &current->children, sibling) {
-		if (!restore_before_setsid(child))
-			continue;
+	ret = parallel_workers > 1 ?
+		tfork_create_siblings_parallel(true, parallel_workers) : 1;
+	if (ret < 0)
+		return ret;
+	if (ret > 0) {
+		list_for_each_entry(child, &current->children, sibling) {
+			if (!restore_before_setsid(child))
+				continue;
 
-		BUG_ON(child->born_sid != -1 && getsid(0) != child->born_sid);
+			BUG_ON(child->born_sid != -1 && getsid(0) != child->born_sid);
 
-		ret = fork_with_pid(child);
-		if (ret < 0)
-			return ret;
+			ret = fork_with_pid(child);
+			if (ret < 0)
+				return ret;
+		}
 	}
 
 	if (current->parent)
 		restore_sid();
 
 	pr_info("Restoring children in our session:\n");
-	list_for_each_entry(child, &current->children, sibling) {
-		if (restore_before_setsid(child))
-			continue;
+	ret = parallel_workers > 1 ?
+		tfork_create_siblings_parallel(false, parallel_workers) : 1;
+	if (ret < 0)
+		return ret;
+	if (ret > 0) {
+		list_for_each_entry(child, &current->children, sibling) {
+			if (restore_before_setsid(child))
+				continue;
 
-		ret = fork_with_pid(child);
-		if (ret < 0)
-			return ret;
+			ret = fork_with_pid(child);
+			if (ret < 0)
+				return ret;
+		}
 	}
 
 	return 0;
