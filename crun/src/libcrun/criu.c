@@ -61,6 +61,7 @@ char *chroot_realpath (const char *chroot, const char *path, char resolved_path[
 
 static const char *console_socket = NULL;
 static int tfork_pre_restore_fd = -1;
+static int tfork_source_detached_fd = -1;
 
 #  define LIBCRIU_MIN_VERSION 31500
 
@@ -257,6 +258,21 @@ criu_notify (char *action, __attribute__ ((unused)) criu_notify_arg_t na)
         return -1;
       close (tfork_pre_restore_fd);
       tfork_pre_restore_fd = -1;
+      return 0;
+    }
+
+  if (strcmp (action, "tfork-source-detached") == 0 && tfork_source_detached_fd >= 0)
+    {
+      char byte = 1;
+      ssize_t n;
+
+      do
+        n = write (tfork_source_detached_fd, &byte, 1);
+      while (n < 0 && errno == EINTR);
+      if (n != 1)
+        return -1;
+      close (tfork_source_detached_fd);
+      tfork_source_detached_fd = -1;
       return 0;
     }
 
@@ -1887,9 +1903,11 @@ libcrun_container_tfork_linux_criu (libcrun_container_t *container, libcrun_chec
     return ret;
 
   tfork_pre_restore_fd = cr_options->tfork_pre_restore_fd;
+  tfork_source_detached_fd = cr_options->tfork_source_detached_fd;
   libcriu_wrapper->criu_set_notify_cb (criu_notify);
   ret = libcriu_wrapper->criu_tfork();
   tfork_pre_restore_fd = -1;
+  tfork_source_detached_fd = -1;
   if (UNLIKELY (ret != 0))
     {
       show_criu_log (cr_options->work_path, CRIU_TFORK_LOG_FILE);
