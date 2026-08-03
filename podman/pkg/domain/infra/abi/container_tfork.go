@@ -37,6 +37,58 @@ const (
 	tforkClonePollInterval   = 200 * time.Millisecond
 )
 
+type tforkSourceSyncMode string
+
+const (
+	tforkSourceSyncFS     tforkSourceSyncMode = "syncfs"
+	tforkSourceSyncGlobal tforkSourceSyncMode = "global"
+	tforkSourceSyncNone   tforkSourceSyncMode = "none"
+)
+
+func tforkSourceSyncModeFromEnv() (tforkSourceSyncMode, error) {
+	value := strings.ToLower(strings.TrimSpace(os.Getenv("PODMAN_TFORK_SYNC_MODE")))
+	if value == "" {
+		return tforkSourceSyncFS, nil
+	}
+	mode := tforkSourceSyncMode(value)
+	switch mode {
+	case tforkSourceSyncFS, tforkSourceSyncGlobal, tforkSourceSyncNone:
+		return mode, nil
+	default:
+		return "", fmt.Errorf("invalid PODMAN_TFORK_SYNC_MODE=%q (must be syncfs, global, or none)", value)
+	}
+}
+
+func tforkSyncSource(rootfs string) error {
+	mode, err := tforkSourceSyncModeFromEnv()
+	if err != nil {
+		return err
+	}
+
+	switch mode {
+	case tforkSourceSyncNone:
+		logrus.Infof("tfork: source sync disabled by PODMAN_TFORK_SYNC_MODE=none")
+		return nil
+	case tforkSourceSyncGlobal:
+		if out, err := exec.Command("sync").CombinedOutput(); err != nil {
+			return fmt.Errorf("global sync: %s: %w", strings.TrimSpace(string(out)), err)
+		}
+		return nil
+	case tforkSourceSyncFS:
+		root, err := os.Open(rootfs)
+		if err != nil {
+			return fmt.Errorf("open source rootfs %s for syncfs: %w", rootfs, err)
+		}
+		defer root.Close()
+		if err := unix.Syncfs(int(root.Fd())); err != nil {
+			return fmt.Errorf("syncfs source rootfs %s: %w", rootfs, err)
+		}
+		return nil
+	default:
+		return fmt.Errorf("unsupported source sync mode %q", mode)
+	}
+}
+
 func tforkCloneReadyTimeoutFromEnv() time.Duration {
 	value := strings.TrimSpace(os.Getenv("PODMAN_TFORK_CLONE_READY_TIMEOUT_SECS"))
 	if value == "" {
@@ -121,8 +173,8 @@ func (ic *ContainerEngine) containerCloneLive(ctx context.Context, opts entities
 		return nil, err
 	}
 
-	if out, err := exec.Command("sync").CombinedOutput(); err != nil {
-		return nil, fmt.Errorf("sync: %s: %w", out, err)
+	if err := tforkSyncSource(srcRootfs); err != nil {
+		return nil, err
 	}
 
 	recursive := false
