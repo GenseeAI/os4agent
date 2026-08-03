@@ -507,7 +507,10 @@ script intentionally refuses to continue if a loaded module cannot be removed.
   its forks.
 - Tclone currently requires rootful Podman, btrfs, amd64, and the custom
   page-cache CoW kernel.
-- The page-cache CoW kernel currently has a known memory leak.
+- Filecow layers are reclaimed with their cached inode/mapping owners rather
+  than eagerly when a child is deleted. Repeated unchanged forks reuse the
+  current layer, so retained layers are bounded by changed generations instead
+  of the total fork count.
 
 See
 [`gensee-crate/docs/tclone.md`](https://github.com/GenseeAI/gensee-crate/blob/main/docs/tclone.md)
