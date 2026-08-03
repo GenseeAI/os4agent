@@ -65,7 +65,7 @@ func cloneFlags(cmd *cobra.Command) {
 	flags.BoolVar(&ctrClone.TforkMetadata, tforkMetadataFlagName, false, "print live-clone identity, PID, and rootfs metadata as JSON (only with --live)")
 
 	tforkInjectFileFlagName := "tfork-inject-file"
-	flags.StringSliceVar(&ctrClone.TforkInjectFiles, tforkInjectFileFlagName, nil, "inject COPY_INDEX:HOST_PATH:CONTAINER_PATH after live restore and before publication")
+	flags.StringSliceVar(&ctrClone.TforkInjectFiles, tforkInjectFileFlagName, nil, "inject COPY_INDEX:HOST_PATH:CONTAINER_PATH after live restore and before publication (new files use Podman's UID/GID; existing ownership is preserved; mode is forced to 0600)")
 
 	tforkGhostLimitFlagName := "tfork-ghost-limit"
 	flags.UintVar(&ctrClone.TforkGhostLimit, tforkGhostLimitFlagName, 256<<20, "raise CRIU's ghost-file size cap (bytes); GUI apps need >1MiB default (only with --live)")

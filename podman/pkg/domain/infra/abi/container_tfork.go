@@ -1054,6 +1054,9 @@ func tforkParseFileInjections(specs []string, copies int) (map[int][]tforkFileIn
 	return parsed, nil
 }
 
+// New destination files inherit Podman's filesystem UID/GID, while an existing
+// destination retains its ownership. All destinations are forced to mode 0600;
+// this interface intentionally does not provide ownership or mode overrides.
 func tforkInjectFileIntoProcessRoot(pid int, injection tforkFileInjection) error {
 	const maximumInjectionSize = 1 << 20
 	sourceFD, err := unix.Open(injection.source, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
