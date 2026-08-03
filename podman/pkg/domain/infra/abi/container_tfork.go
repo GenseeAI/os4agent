@@ -220,6 +220,7 @@ func (ic *ContainerEngine) containerCloneLive(ctx context.Context, opts entities
 	cloneIDs := make([]string, copies)
 	cloneRootfsList := make([]string, copies)
 	cloneRootfsRel := make([]string, copies)
+	overlapSocketPurge := os.Getenv("PODMAN_TFORK_OVERLAP_SOCKET_PURGE") == "1"
 	for i := 0; i < copies; i++ {
 		cloneIDs[i] = stringid.GenerateRandomID()
 		var rel string
@@ -243,8 +244,10 @@ func (ic *ContainerEngine) containerCloneLive(ctx context.Context, opts entities
 				return nil, fmt.Errorf("setup snap-subvol rootfs for copy %d: %w", i, err)
 			}
 		}
-		if err := tforkPurgeSockets(cloneRootfsList[i]); err != nil {
-			logrus.Warnf("tfork: purge sockets in %s: %v (proceeding)", cloneRootfsList[i], err)
+		if !overlapSocketPurge {
+			if err := tforkPurgeSockets(cloneRootfsList[i]); err != nil {
+				logrus.Warnf("tfork: purge sockets in %s: %v (proceeding)", cloneRootfsList[i], err)
+			}
 		}
 
 		if srcPID, perr := src.PID(); perr == nil && srcPID > 0 {
@@ -260,6 +263,39 @@ func (ic *ContainerEngine) containerCloneLive(ctx context.Context, opts entities
 				logrus.Warnf("tfork: read source resolv.conf %s: %v", srcResolv, rerr)
 			}
 		}
+	}
+	var socketPurgeRead *os.File
+	var socketPurgeFinished chan struct{}
+	var socketPurgeErr error
+	waitSocketPurge := func() error {
+		if socketPurgeFinished == nil {
+			return nil
+		}
+		<-socketPurgeFinished
+		return socketPurgeErr
+	}
+	if overlapSocketPurge {
+		readEnd, writeEnd, err := os.Pipe()
+		if err != nil {
+			return nil, fmt.Errorf("create socket-purge barrier: %w", err)
+		}
+		socketPurgeRead = readEnd
+		socketPurgeFinished = make(chan struct{})
+		manifestPath := filepath.Join(bundleDir, "socket-paths.manifest0")
+		go func() {
+			defer close(socketPurgeFinished)
+			defer writeEnd.Close()
+			socketPurgeErr = tforkPurgeSocketsAndSignal(cloneRootfsList, manifestPath, writeEnd)
+			if socketPurgeErr != nil {
+				logrus.Errorf("tfork: overlapped socket purge failed; restore remains blocked: %v", socketPurgeErr)
+			}
+		}()
+		defer func() {
+			_ = waitSocketPurge()
+			if socketPurgeRead != nil {
+				_ = socketPurgeRead.Close()
+			}
+		}()
 	}
 	txn.setCloneIDs(cloneIDs)
 	if err := tforkInjectFault("after_filesystem"); err != nil {
@@ -527,6 +563,14 @@ func (ic *ContainerEngine) containerCloneLive(ctx context.Context, opts entities
 	useConmon := copies == 1 && useSingleCopyConmon
 
 	if useConmon {
+		if socketPurgeRead != nil {
+			purgeErr := waitSocketPurge()
+			_ = socketPurgeRead.Close()
+			socketPurgeRead = nil
+			if purgeErr != nil {
+				return nil, fmt.Errorf("purge clone sockets before restore: %w", purgeErr)
+			}
+		}
 		conmonInheritFds := inheritFds
 		if hasTTY {
 			conmonInheritFds = filterOutTtyInheritFds(inheritFds)
@@ -603,6 +647,13 @@ func (ic *ContainerEngine) containerCloneLive(ctx context.Context, opts entities
 		for _, pcArg := range perCopyArgs {
 			directArgs = append(directArgs, pcArg)
 		}
+		if socketPurgeRead != nil {
+			barrierFD := 3 + len(perCopyExtraFiles)
+			if hasTTY && !skipTtySrcFds {
+				barrierFD += len(ttySrcFds)
+			}
+			directArgs = append(directArgs, "--tfork-pre-restore-fd", strconv.Itoa(barrierFD))
+		}
 		directArgs = append(directArgs, cloneIDs[0])
 		crunCmd := exec.Command(defaultCrunPath, directArgs...)
 		crunCmd.Stdin = nil
@@ -611,6 +662,9 @@ func (ic *ContainerEngine) containerCloneLive(ctx context.Context, opts entities
 		}
 		if len(perCopyExtraFiles) > 0 {
 			crunCmd.ExtraFiles = append(crunCmd.ExtraFiles, perCopyExtraFiles...)
+		}
+		if socketPurgeRead != nil {
+			crunCmd.ExtraFiles = append(crunCmd.ExtraFiles, socketPurgeRead)
 		}
 		logPath := filepath.Join(bundleDir, "crun-tfork.log")
 		logF, err := os.Create(logPath)
@@ -622,6 +676,10 @@ func (ic *ContainerEngine) containerCloneLive(ctx context.Context, opts entities
 		if err := crunCmd.Start(); err != nil {
 			logF.Close()
 			return nil, fmt.Errorf("start crun tfork: %w", err)
+		}
+		if socketPurgeRead != nil {
+			_ = socketPurgeRead.Close()
+			socketPurgeRead = nil
 		}
 		txn.trackPID(crunCmd.Process.Pid, "crun-tfork")
 		crunDone := make(chan error, 1)
@@ -719,6 +777,9 @@ func (ic *ContainerEngine) containerCloneLive(ctx context.Context, opts entities
 			if crunExited && readyCopies < copies {
 				tforkAbortCrunCmd(crunCmd, src, bundleDir, copies)
 				crunAborted = true
+				if purgeErr := waitSocketPurge(); purgeErr != nil {
+					return nil, fmt.Errorf("purge clone sockets before restore: %w", purgeErr)
+				}
 				return nil, fmt.Errorf("crun tfork exited before %d clones came up (got %d); see %s",
 					copies, readyCopies, logPath)
 			}
@@ -740,6 +801,11 @@ func (ic *ContainerEngine) containerCloneLive(ctx context.Context, opts entities
 				return nil, fmt.Errorf("timeout waiting %s for crun tfork to finish after %d clones came up; see %s",
 					cloneReadyTimeout, copies, logPath)
 			}
+		}
+		if purgeErr := waitSocketPurge(); purgeErr != nil {
+			tforkAbortCrunCmd(crunCmd, src, bundleDir, copies)
+			crunAborted = true
+			return nil, fmt.Errorf("purge clone sockets before restore: %w", purgeErr)
 		}
 		if crunErr != nil {
 			tforkAbortCrunCmd(crunCmd, src, bundleDir, copies)
@@ -2160,6 +2226,57 @@ func tforkPurgeSockets(rootfs string) error {
 	if len(out) > 0 {
 		n := strings.Count(string(out), "\n")
 		logrus.Infof("tfork: purged %d unix socket(s) from %s", n, rootfs)
+	}
+	return nil
+}
+
+func tforkPurgeSocketsWithManifest(rootfsList []string, manifestPath string) error {
+	if len(rootfsList) == 0 {
+		return fmt.Errorf("socket purge requires at least one clone rootfs")
+	}
+	started := time.Now()
+	cmd := exec.Command("find", rootfsList[0], "-mindepth", "1", "-type", "s", "-printf", "%P\\0")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("find socket manifest in %s: %s: %w", rootfsList[0], strings.TrimSpace(string(out)), err)
+	}
+	if err := os.WriteFile(manifestPath, out, 0o600); err != nil {
+		return fmt.Errorf("write socket manifest %s: %w", manifestPath, err)
+	}
+
+	count := 0
+	for _, rel := range strings.Split(string(out), "\x00") {
+		if rel == "" {
+			continue
+		}
+		clean := filepath.Clean(rel)
+		if filepath.IsAbs(clean) || clean == ".." || strings.HasPrefix(clean, ".."+string(os.PathSeparator)) {
+			return fmt.Errorf("unsafe socket path %q in %s", rel, manifestPath)
+		}
+		count++
+		for _, rootfs := range rootfsList {
+			if err := os.Remove(filepath.Join(rootfs, clean)); err != nil && !os.IsNotExist(err) {
+				return fmt.Errorf("remove socket %s from %s: %w", clean, rootfs, err)
+			}
+		}
+	}
+	logrus.Infof("tfork: socket manifest found %d path(s), applied to %d clone rootfs(es) in %s",
+		count, len(rootfsList), time.Since(started))
+	return nil
+}
+
+// tforkPurgeSocketsAndSignal opens the restore barrier only after every clone
+// rootfs has been purged. On any error it writes no byte, so closing barrier
+// produces EOF in crun and makes the clone transaction roll back.
+func tforkPurgeSocketsAndSignal(rootfsList []string, manifestPath string, barrier *os.File) error {
+	if barrier == nil {
+		return fmt.Errorf("socket-purge barrier is nil")
+	}
+	if err := tforkPurgeSocketsWithManifest(rootfsList, manifestPath); err != nil {
+		return err
+	}
+	if _, err := barrier.Write([]byte{1}); err != nil {
+		return fmt.Errorf("signal socket-purge completion: %w", err)
 	}
 	return nil
 }
