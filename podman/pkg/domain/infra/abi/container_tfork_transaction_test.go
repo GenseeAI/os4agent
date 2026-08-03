@@ -1,0 +1,201 @@
+//go:build !remote
+
+package abi
+
+import (
+	"errors"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+)
+
+func TestTforkInjectFault(t *testing.T) {
+	t.Setenv("PODMAN_TFORK_FAULT_INJECT", "after_freeze, before_commit")
+	for _, stage := range []string{"after_freeze", "before_commit"} {
+		if err := tforkInjectFault(stage); err == nil {
+			t.Fatalf("expected injected fault at %s", stage)
+		}
+	}
+	if err := tforkInjectFault("after_restore"); err != nil {
+		t.Fatalf("unexpected fault at unselected stage: %v", err)
+	}
+}
+
+func TestTforkCgroupFSPath(t *testing.T) {
+	for _, unsafe := range []string{"", ".", "/", "..", "../escape"} {
+		if got := tforkCgroupFSPath(unsafe); got != "" {
+			t.Errorf("tforkCgroupFSPath(%q) = %q; want empty", unsafe, got)
+		}
+	}
+	const rel = "machine.slice/libpod-test"
+	if got, want := tforkCgroupFSPath(rel), "/sys/fs/cgroup/"+rel; got != want {
+		t.Fatalf("tforkCgroupFSPath(%q) = %q; want %q", rel, got, want)
+	}
+}
+
+func TestTforkPIDRunning(t *testing.T) {
+	if err := tforkPIDRunning(os.Getpid()); err != nil {
+		t.Fatalf("current process should be running: %v", err)
+	}
+	if err := tforkPIDRunning(-1); err == nil {
+		t.Fatal("negative pid unexpectedly reported running")
+	}
+}
+
+func TestTforkParseFileInjections(t *testing.T) {
+	parsed, err := tforkParseFileInjections([]string{
+		"0:/tmp/source-0:/tmp/context.json",
+		"1:/tmp/source-1:/run/context.json",
+	}, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := parsed[1][0].destination; got != "/run/context.json" {
+		t.Fatalf("destination = %q", got)
+	}
+	for _, spec := range []string{
+		"missing-fields",
+		"2:/tmp/source:/tmp/context",
+		"0:relative:/tmp/context",
+		"0:/tmp/source:relative",
+	} {
+		if _, err := tforkParseFileInjections([]string{spec}, 2); err == nil {
+			t.Fatalf("expected %q to fail", spec)
+		}
+	}
+}
+
+func TestTforkParseSourceFileInjections(t *testing.T) {
+	parsed, err := tforkParseSourceFileInjections([]string{
+		"/tmp/source.json:/tmp/gensee-run-context.json",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(parsed) != 1 || parsed[0].source != "/tmp/source.json" || parsed[0].destination != "/tmp/gensee-run-context.json" {
+		t.Fatalf("unexpected source file injections: %#v", parsed)
+	}
+	if _, err := tforkParseSourceFileInjections([]string{"relative:/tmp/context"}); err == nil {
+		t.Fatal("expected relative source path to fail")
+	}
+	if _, err := tforkParseSourceFileInjections([]string{
+		"/tmp/source-0:/tmp/context",
+		"/tmp/source-1:/tmp/context",
+	}); err == nil {
+		t.Fatal("expected duplicate destination to fail")
+	}
+}
+
+func TestTforkInstallPreparedFileInjectionsRollsBackBatch(t *testing.T) {
+	dir := t.TempDir()
+	existing := filepath.Join(dir, "existing")
+	created := filepath.Join(dir, "created")
+	if err := os.WriteFile(existing, []byte("original"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	injections := []tforkPreparedFileInjection{
+		{source: "/host/first", destination: existing, payload: []byte("replacement")},
+		{source: "/host/second", destination: created, payload: []byte("new")},
+	}
+	wantFailure := errors.New("fail after second commit")
+	err := tforkInstallPreparedFileInjections(os.Getpid(), injections, func(index int) error {
+		if index == 1 {
+			return wantFailure
+		}
+		return nil
+	})
+	if !errors.Is(err, wantFailure) {
+		t.Fatalf("install error = %v; want %v", err, wantFailure)
+	}
+	data, err := os.ReadFile(existing)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := string(data), "original"; got != want {
+		t.Fatalf("existing content = %q; want %q", got, want)
+	}
+	if info, err := os.Stat(existing); err != nil {
+		t.Fatal(err)
+	} else if got, want := info.Mode().Perm(), os.FileMode(0o640); got != want {
+		t.Fatalf("existing mode = %o; want %o", got, want)
+	}
+	if _, err := os.Stat(created); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("new destination survived rollback: %v", err)
+	}
+	assertNoTforkInjectionTemporaryFiles(t, dir)
+}
+
+func TestTforkInstallPreparedFileInjectionsCommitsBatch(t *testing.T) {
+	dir := t.TempDir()
+	existing := filepath.Join(dir, "existing")
+	created := filepath.Join(dir, "created")
+	if err := os.WriteFile(existing, []byte("original"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	injections := []tforkPreparedFileInjection{
+		{source: "/host/first", destination: existing, payload: []byte("replacement")},
+		{source: "/host/second", destination: created, payload: []byte("new")},
+	}
+	if err := tforkInstallPreparedFileInjections(os.Getpid(), injections, nil); err != nil {
+		t.Fatal(err)
+	}
+	for path, want := range map[string]string{existing: "replacement", created: "new"} {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := string(data); got != want {
+			t.Fatalf("%s content = %q; want %q", path, got, want)
+		}
+		if info, err := os.Stat(path); err != nil {
+			t.Fatal(err)
+		} else if got, want := info.Mode().Perm(), os.FileMode(0o600); got != want {
+			t.Fatalf("%s mode = %o; want %o", path, got, want)
+		}
+	}
+	assertNoTforkInjectionTemporaryFiles(t, dir)
+}
+
+func assertNoTforkInjectionTemporaryFiles(t *testing.T, dir string) {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), ".tfork-inject-") {
+			t.Fatalf("source injection left temporary file %s", entry.Name())
+		}
+	}
+}
+
+func TestTforkTransactionRollbackIsIdempotent(t *testing.T) {
+	temp := t.TempDir()
+	bundle := filepath.Join(temp, "graph", "tfork-bundles", "batch")
+	runtimeBatch := filepath.Join(temp, "run", "tfork", "batch")
+	for _, path := range []string{bundle, runtimeBatch} {
+		if err := os.MkdirAll(path, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	restoreCalls := 0
+	txn := newTforkCloneTransaction(t.Context(), nil, nil, bundle, 1)
+	txn.setRuntimeBatchDir(runtimeBatch)
+	txn.setSourceRestore(func() error {
+		restoreCalls++
+		return nil
+	})
+	txn.rollback(errors.New("test"))
+	txn.rollback(errors.New("test again"))
+
+	if restoreCalls != 1 {
+		t.Fatalf("source restore called %d times; want exactly once", restoreCalls)
+	}
+	for _, path := range []string{bundle, runtimeBatch} {
+		if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("rollback left %s: %v", path, err)
+		}
+	}
+}

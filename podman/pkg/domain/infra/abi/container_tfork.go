@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"net"
 	"os"
@@ -19,12 +20,14 @@ import (
 
 	"github.com/containers/podman/v5/libpod"
 	"github.com/containers/podman/v5/libpod/define"
+	"github.com/cyphar/filepath-securejoin/pathrs-lite"
 
 	"github.com/containers/podman/v5/pkg/domain/entities"
 	"github.com/containers/podman/v5/utils"
 	spec "github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/sirupsen/logrus"
 	"go.podman.io/common/libnetwork/types"
+	commonconfig "go.podman.io/common/pkg/config"
 	"go.podman.io/storage/pkg/stringid"
 	"golang.org/x/sys/unix"
 )
@@ -36,6 +39,58 @@ const (
 	tforkCgroupPollInterval  = 50 * time.Millisecond
 	tforkClonePollInterval   = 200 * time.Millisecond
 )
+
+type tforkSourceSyncMode string
+
+const (
+	tforkSourceSyncFS     tforkSourceSyncMode = "syncfs"
+	tforkSourceSyncGlobal tforkSourceSyncMode = "global"
+	tforkSourceSyncNone   tforkSourceSyncMode = "none"
+)
+
+func tforkSourceSyncModeFromEnv() (tforkSourceSyncMode, error) {
+	value := strings.ToLower(strings.TrimSpace(os.Getenv("PODMAN_TFORK_SYNC_MODE")))
+	if value == "" {
+		return tforkSourceSyncFS, nil
+	}
+	mode := tforkSourceSyncMode(value)
+	switch mode {
+	case tforkSourceSyncFS, tforkSourceSyncGlobal, tforkSourceSyncNone:
+		return mode, nil
+	default:
+		return "", fmt.Errorf("invalid PODMAN_TFORK_SYNC_MODE=%q (must be syncfs, global, or none)", value)
+	}
+}
+
+func tforkSyncSource(rootfs string) error {
+	mode, err := tforkSourceSyncModeFromEnv()
+	if err != nil {
+		return err
+	}
+
+	switch mode {
+	case tforkSourceSyncNone:
+		logrus.Infof("tfork: source sync disabled by PODMAN_TFORK_SYNC_MODE=none")
+		return nil
+	case tforkSourceSyncGlobal:
+		if out, err := exec.Command("sync").CombinedOutput(); err != nil {
+			return fmt.Errorf("global sync: %s: %w", strings.TrimSpace(string(out)), err)
+		}
+		return nil
+	case tforkSourceSyncFS:
+		root, err := os.Open(rootfs)
+		if err != nil {
+			return fmt.Errorf("open source rootfs %s for syncfs: %w", rootfs, err)
+		}
+		defer root.Close()
+		if err := unix.Syncfs(int(root.Fd())); err != nil {
+			return fmt.Errorf("syncfs source rootfs %s: %w", rootfs, err)
+		}
+		return nil
+	default:
+		return fmt.Errorf("unsupported source sync mode %q", mode)
+	}
+}
 
 func tforkCloneReadyTimeoutFromEnv() time.Duration {
 	value := strings.TrimSpace(os.Getenv("PODMAN_TFORK_CLONE_READY_TIMEOUT_SECS"))
@@ -63,12 +118,27 @@ func (ic *ContainerEngine) containerCloneLive(ctx context.Context, opts entities
 	if state != define.ContainerStateRunning {
 		return nil, fmt.Errorf("source %q is not running (state=%s); tfork requires a live source", src.ID(), state.String())
 	}
+	if manager := src.CgroupManager(); manager != commonconfig.CgroupfsCgroupsManager {
+		return nil, fmt.Errorf("tfork currently requires the cgroupfs cgroup manager (source uses %q); retry Podman with --cgroup-manager=cgroupfs", manager)
+	}
 
 	copies := opts.Copies
 	if copies <= 0 {
 		copies = 1
 	}
 	requestedCopies := copies
+	fileInjections, err := tforkParseFileInjections(opts.TforkInjectFiles, requestedCopies)
+	if err != nil {
+		return nil, err
+	}
+	sourceFileInjections, err := tforkParseSourceFileInjections(opts.TforkInjectSourceFiles)
+	if err != nil {
+		return nil, err
+	}
+	preparedSourceFileInjections, err := tforkPrepareFileInjections(sourceFileInjections)
+	if err != nil {
+		return nil, fmt.Errorf("prepare source file injection: %w", err)
+	}
 	useSingleCopyConmon := requestedCopies == 1 && os.Getenv("PODMAN_TFORK_SINGLE_COPY_CONMON") == "1"
 	// PODMAN_TFORK_SINGLE_COPY_DIRECT is a debugging escape hatch that skips
 	// the n-copy restore helper for single-copy experiments. Production paths
@@ -97,25 +167,38 @@ func (ic *ContainerEngine) containerCloneLive(ctx context.Context, opts entities
 	if err := os.MkdirAll(bundleDir, 0o700); err != nil {
 		return nil, fmt.Errorf("mkdir bundle: %w", err)
 	}
+	txn := newTforkCloneTransaction(ctx, ic.Libpod, src, bundleDir, copies)
+	defer func() {
+		if retErr != nil {
+			txn.rollback(retErr)
+		}
+	}()
+	// A completed source rotation is the irreversible commit point for that
+	// side effect. Clone rollback still removes unpublished children, but must
+	// not overwrite a credential the live source may have observed after thaw.
+	sourceInjectionCommitted := false
+	defer func() {
+		if retErr != nil && sourceInjectionCommitted {
+			retErr = fmt.Errorf("%w; source file rotation was committed and was not rolled back", retErr)
+		}
+	}()
 
 	snapRO := filepath.Join(bundleDir, "snap-ro")
 
+	if err := tforkInjectFault("before_freeze"); err != nil {
+		return nil, err
+	}
 	thawSource, err := tforkFreezeSourceCgroup(src, tforkSourceFreezeTimeout)
 	if err != nil {
 		return nil, fmt.Errorf("freeze source cgroup before tfork snapshot: %w", err)
 	}
-	sourceThawed := false
-	defer func() {
-		if sourceThawed {
-			return
-		}
-		if err := thawSource(); err != nil {
-			logrus.Warnf("tfork: thaw source cgroup after clone setup: %v", err)
-		}
-	}()
+	txn.setSourceRestore(thawSource)
+	if err := tforkInjectFault("after_freeze"); err != nil {
+		return nil, err
+	}
 
-	if out, err := exec.Command("sync").CombinedOutput(); err != nil {
-		return nil, fmt.Errorf("sync: %s: %w", out, err)
+	if err := tforkSyncSource(srcRootfs); err != nil {
+		return nil, err
 	}
 
 	recursive := false
@@ -161,6 +244,7 @@ func (ic *ContainerEngine) containerCloneLive(ctx context.Context, opts entities
 	cloneIDs := make([]string, copies)
 	cloneRootfsList := make([]string, copies)
 	cloneRootfsRel := make([]string, copies)
+	overlapSocketPurge := os.Getenv("PODMAN_TFORK_OVERLAP_SOCKET_PURGE") == "1"
 	for i := 0; i < copies; i++ {
 		cloneIDs[i] = stringid.GenerateRandomID()
 		var rel string
@@ -184,8 +268,10 @@ func (ic *ContainerEngine) containerCloneLive(ctx context.Context, opts entities
 				return nil, fmt.Errorf("setup snap-subvol rootfs for copy %d: %w", i, err)
 			}
 		}
-		if err := tforkPurgeSockets(cloneRootfsList[i]); err != nil {
-			logrus.Warnf("tfork: purge sockets in %s: %v (proceeding)", cloneRootfsList[i], err)
+		if !overlapSocketPurge {
+			if err := tforkPurgeSockets(cloneRootfsList[i]); err != nil {
+				logrus.Warnf("tfork: purge sockets in %s: %v (proceeding)", cloneRootfsList[i], err)
+			}
 		}
 
 		if srcPID, perr := src.PID(); perr == nil && srcPID > 0 {
@@ -201,6 +287,43 @@ func (ic *ContainerEngine) containerCloneLive(ctx context.Context, opts entities
 				logrus.Warnf("tfork: read source resolv.conf %s: %v", srcResolv, rerr)
 			}
 		}
+	}
+	var socketPurgeRead *os.File
+	var socketPurgeFinished chan struct{}
+	var socketPurgeErr error
+	waitSocketPurge := func() error {
+		if socketPurgeFinished == nil {
+			return nil
+		}
+		<-socketPurgeFinished
+		return socketPurgeErr
+	}
+	if overlapSocketPurge {
+		readEnd, writeEnd, err := os.Pipe()
+		if err != nil {
+			return nil, fmt.Errorf("create socket-purge barrier: %w", err)
+		}
+		socketPurgeRead = readEnd
+		socketPurgeFinished = make(chan struct{})
+		manifestPath := filepath.Join(bundleDir, "socket-paths.manifest0")
+		go func() {
+			defer close(socketPurgeFinished)
+			defer writeEnd.Close()
+			socketPurgeErr = tforkPurgeSocketsAndSignal(cloneRootfsList, manifestPath, writeEnd)
+			if socketPurgeErr != nil {
+				logrus.Errorf("tfork: overlapped socket purge failed; restore remains blocked: %v", socketPurgeErr)
+			}
+		}()
+		defer func() {
+			_ = waitSocketPurge()
+			if socketPurgeRead != nil {
+				_ = socketPurgeRead.Close()
+			}
+		}()
+	}
+	txn.setCloneIDs(cloneIDs)
+	if err := tforkInjectFault("after_filesystem"); err != nil {
+		return nil, err
 	}
 
 	if recursive && parentUpperFrozen != "" {
@@ -305,6 +428,7 @@ func (ic *ContainerEngine) containerCloneLive(ctx context.Context, opts entities
 	if err := os.MkdirAll(imgDir, 0o700); err != nil {
 		return nil, fmt.Errorf("mkdir img: %w", err)
 	}
+	txn.setImageDir(imgDir)
 
 	cloneCgroupPaths := make([]string, copies)
 	if cfg := src.Config(); cfg != nil {
@@ -317,6 +441,7 @@ func (ic *ContainerEngine) containerCloneLive(ctx context.Context, opts entities
 			cloneCgroupPaths[i] = cgRel
 		}
 	}
+	txn.setCgroupPaths(cloneCgroupPaths)
 
 	srcStatePath := fmt.Sprintf("/run/crun/%s/status", src.ID())
 	crunArgs := []string{
@@ -383,6 +508,15 @@ func (ic *ContainerEngine) containerCloneLive(ctx context.Context, opts entities
 	default:
 		return nil, fmt.Errorf("invalid --persistent value %q (must be \"async\" or \"sync\")", opts.Persistent)
 	}
+	if opts.TforkNetworkLock == "" {
+		opts.TforkNetworkLock = "nftables"
+	}
+	switch opts.TforkNetworkLock {
+	case "iptables", "nftables":
+		crunArgs = append(crunArgs, "--network-lock", opts.TforkNetworkLock)
+	default:
+		return nil, fmt.Errorf("invalid --tfork-network-lock value %q (must be \"iptables\" or \"nftables\")", opts.TforkNetworkLock)
+	}
 	dumpdHolderPid := 0
 	var dumpdHolderStartTime uint64
 	if opts.Persistent == "async" {
@@ -429,6 +563,9 @@ func (ic *ContainerEngine) containerCloneLive(ctx context.Context, opts entities
 		crunArgs = append(crunArgs, "--parent-path", parentImgDir)
 		logrus.Infof("tfork: --with-previous chains off clone %s (imgDir=%s)", parentCloneID, parentImgDir)
 	}
+	if err := tforkInjectFault("before_restore"); err != nil {
+		return nil, err
+	}
 
 	cloneLogPaths := make([]string, copies)
 	cloneConmonPids := make([]int, copies)
@@ -450,6 +587,14 @@ func (ic *ContainerEngine) containerCloneLive(ctx context.Context, opts entities
 	useConmon := copies == 1 && useSingleCopyConmon
 
 	if useConmon {
+		if socketPurgeRead != nil {
+			purgeErr := waitSocketPurge()
+			_ = socketPurgeRead.Close()
+			socketPurgeRead = nil
+			if purgeErr != nil {
+				return nil, fmt.Errorf("purge clone sockets before restore: %w", purgeErr)
+			}
+		}
 		conmonInheritFds := inheritFds
 		if hasTTY {
 			conmonInheritFds = filterOutTtyInheritFds(inheritFds)
@@ -472,6 +617,7 @@ func (ic *ContainerEngine) containerCloneLive(ctx context.Context, opts entities
 			ghostLimit:     opts.TforkGhostLimit,
 			tcpClose:       opts.TforkTCPClose,
 			fullMemcopy:    opts.TforkFullMemcopy,
+			networkLock:    opts.TforkNetworkLock,
 			cgroupRoot:     cloneCgroupPaths[0],
 			dumpdHolderPid: dumpdHolderPid,
 		})
@@ -480,9 +626,29 @@ func (ic *ContainerEngine) containerCloneLive(ctx context.Context, opts entities
 		}
 		cloneLogPaths[0] = logPath
 		cloneConmonPids[0] = conmonPid
+		txn.trackPID(conmonPid, "conmon")
 		logrus.Infof("tfork: clone %s up via conmon pid=%d; log=%s", cloneIDs[0], conmonPid, logPath)
 	} else {
 		directArgs := append([]string{}, crunArgs...)
+		eventReadiness := os.Getenv("PODMAN_TFORK_EVENT_READINESS") == "1"
+		var sourceDetachedRead *os.File
+		var sourceDetachedWrite *os.File
+		var sourceDetachedDone chan error
+		if eventReadiness {
+			var err error
+			sourceDetachedRead, sourceDetachedWrite, err = os.Pipe()
+			if err != nil {
+				return nil, fmt.Errorf("create source-detached event pipe: %w", err)
+			}
+			defer func() {
+				if sourceDetachedRead != nil {
+					_ = sourceDetachedRead.Close()
+				}
+				if sourceDetachedWrite != nil {
+					_ = sourceDetachedWrite.Close()
+				}
+			}()
+		}
 		if dumpdHolderPid > 0 {
 			directArgs = append(directArgs,
 				fmt.Sprintf("--tfork-dumpd-parent=%d", dumpdHolderPid))
@@ -524,6 +690,17 @@ func (ic *ContainerEngine) containerCloneLive(ctx context.Context, opts entities
 		for _, pcArg := range perCopyArgs {
 			directArgs = append(directArgs, pcArg)
 		}
+		nextExtraFD := 3 + len(perCopyExtraFiles)
+		if hasTTY && !skipTtySrcFds {
+			nextExtraFD += len(ttySrcFds)
+		}
+		if socketPurgeRead != nil {
+			directArgs = append(directArgs, "--tfork-pre-restore-fd", strconv.Itoa(nextExtraFD))
+			nextExtraFD++
+		}
+		if sourceDetachedWrite != nil {
+			directArgs = append(directArgs, "--tfork-source-detached-fd", strconv.Itoa(nextExtraFD))
+		}
 		directArgs = append(directArgs, cloneIDs[0])
 		crunCmd := exec.Command(defaultCrunPath, directArgs...)
 		crunCmd.Stdin = nil
@@ -532,6 +709,12 @@ func (ic *ContainerEngine) containerCloneLive(ctx context.Context, opts entities
 		}
 		if len(perCopyExtraFiles) > 0 {
 			crunCmd.ExtraFiles = append(crunCmd.ExtraFiles, perCopyExtraFiles...)
+		}
+		if socketPurgeRead != nil {
+			crunCmd.ExtraFiles = append(crunCmd.ExtraFiles, socketPurgeRead)
+		}
+		if sourceDetachedWrite != nil {
+			crunCmd.ExtraFiles = append(crunCmd.ExtraFiles, sourceDetachedWrite)
 		}
 		logPath := filepath.Join(bundleDir, "crun-tfork.log")
 		logF, err := os.Create(logPath)
@@ -544,6 +727,24 @@ func (ic *ContainerEngine) containerCloneLive(ctx context.Context, opts entities
 			logF.Close()
 			return nil, fmt.Errorf("start crun tfork: %w", err)
 		}
+		if socketPurgeRead != nil {
+			_ = socketPurgeRead.Close()
+			socketPurgeRead = nil
+		}
+		if sourceDetachedWrite != nil {
+			_ = sourceDetachedWrite.Close()
+			sourceDetachedWrite = nil
+			sourceDetachedDone = make(chan error, 1)
+			go func() {
+				var byte [1]byte
+				n, err := sourceDetachedRead.Read(byte[:])
+				if err == nil && n != 1 {
+					err = fmt.Errorf("short source-detached event read: %d bytes", n)
+				}
+				sourceDetachedDone <- err
+			}()
+		}
+		txn.trackPID(crunCmd.Process.Pid, "crun-tfork")
 		crunDone := make(chan error, 1)
 		var crunAborted bool
 		defer func() {
@@ -564,6 +765,7 @@ func (ic *ContainerEngine) containerCloneLive(ctx context.Context, opts entities
 			shortBatch = shortBatch[:12]
 		}
 		runtimeAttachBase := filepath.Join("/run/libpod/tfork", shortBatch)
+		txn.setRuntimeBatchDir(runtimeAttachBase)
 		for i := 0; i < copies; i++ {
 			perCopyBundle := filepath.Join(runtimeAttachBase, fmt.Sprintf("%d", i))
 			if err := os.MkdirAll(perCopyBundle, 0o700); err != nil {
@@ -586,8 +788,11 @@ func (ic *ContainerEngine) containerCloneLive(ctx context.Context, opts entities
 			} else {
 				cloneLogPath = filepath.Join(bundleDir, fmt.Sprintf("clone.%d.log", i))
 			}
-			if err := spawnTforkStdioHelper(readEnd, perCopyAttachSocks[i], cloneLogPath, hasTTY); err != nil {
+			helperPID, err := spawnTforkStdioHelper(readEnd, perCopyAttachSocks[i], cloneLogPath, hasTTY)
+			if err != nil {
 				logrus.Warnf("tfork: per-copy %d stdio-helper spawn: %v", i, err)
+			} else {
+				txn.trackPID(helperPID, fmt.Sprintf("stdio-helper-%d", i))
 			}
 			if perCopyAttachSocks[i] != nil {
 				_ = perCopyAttachSocks[i].Close()
@@ -610,52 +815,114 @@ func (ic *ContainerEngine) containerCloneLive(ctx context.Context, opts entities
 		stateReady := !needState
 		crunExited := false
 		var crunErr error
-		for readyCopies < copies || !stateReady {
-			if !crunExited {
+		if eventReadiness {
+			timer := time.NewTimer(cloneReadyTimeout)
+			defer timer.Stop()
+			sourceDetached := false
+			for !crunExited || !sourceDetached {
 				select {
+				case detachErr := <-sourceDetachedDone:
+					if detachErr != nil {
+						tforkAbortCrunCmd(crunCmd, src, bundleDir, copies)
+						crunAborted = true
+						return nil, fmt.Errorf("wait for tfork source-detached event: %w; see %s", detachErr, logPath)
+					}
+					sourceDetached = true
+					if len(preparedSourceFileInjections) == 0 {
+						if err := txn.restoreSourceOnce(); err != nil {
+							tforkAbortCrunCmd(crunCmd, src, bundleDir, copies)
+							crunAborted = true
+							return nil, fmt.Errorf("early thaw at tfork source-detached event: %w", err)
+						}
+						logrus.Infof("tfork: source thawed at CRIU source-detached event")
+					} else {
+						logrus.Infof("tfork: source detached; deferring thaw until post-restore source file rotation")
+					}
 				case crunErr = <-crunDone:
 					crunExited = true
-				default:
+					if crunErr != nil {
+						tforkAbortCrunCmd(crunCmd, src, bundleDir, copies)
+						crunAborted = true
+						return nil, fmt.Errorf("crun tfork failed before event readiness: %w; see %s", crunErr, logPath)
+					}
+				case <-timer.C:
+					tforkAbortCrunCmd(crunCmd, src, bundleDir, copies)
+					crunAborted = true
+					return nil, fmt.Errorf("timeout waiting %s for tfork source-detached and runtime-exit events; see %s",
+						cloneReadyTimeout, logPath)
 				}
 			}
+
 			readyCopies = 0
 			for i := 0; i < copies; i++ {
 				if _, err := os.Stat(pidFileFor(i)); err == nil {
 					readyCopies++
 				}
 			}
-			if needState && !stateReady {
-				if _, err := os.Stat(statePath); err == nil {
-					stateReady = true
+			if needState {
+				_, err := os.Stat(statePath)
+				stateReady = err == nil
+			}
+			if readyCopies < copies || !stateReady {
+				return nil, fmt.Errorf("crun exited successfully but clone readiness artifacts are incomplete: pidfiles=%d/%d stateReady=%v; see %s",
+					readyCopies, copies, stateReady, logPath)
+			}
+		} else {
+			for readyCopies < copies || !stateReady {
+				if !crunExited {
+					select {
+					case crunErr = <-crunDone:
+						crunExited = true
+					default:
+					}
+				}
+				readyCopies = 0
+				for i := 0; i < copies; i++ {
+					if _, err := os.Stat(pidFileFor(i)); err == nil {
+						readyCopies++
+					}
+				}
+				if needState && !stateReady {
+					if _, err := os.Stat(statePath); err == nil {
+						stateReady = true
+					}
+				}
+				if readyCopies >= copies && stateReady {
+					break
+				}
+				if crunExited && readyCopies < copies {
+					tforkAbortCrunCmd(crunCmd, src, bundleDir, copies)
+					crunAborted = true
+					if purgeErr := waitSocketPurge(); purgeErr != nil {
+						return nil, fmt.Errorf("purge clone sockets before restore: %w", purgeErr)
+					}
+					return nil, fmt.Errorf("crun tfork exited before %d clones came up (got %d); see %s",
+						copies, readyCopies, logPath)
+				}
+				if time.Now().After(deadline) {
+					tforkAbortCrunCmd(crunCmd, src, bundleDir, copies)
+					crunAborted = true
+					return nil, fmt.Errorf("timeout waiting for %d tfork.pid* files in %s (got %d, stateReady=%v); see %s",
+						copies, imgDir, readyCopies, stateReady, logPath)
+				}
+				time.Sleep(tforkClonePollInterval)
+			}
+			if !crunExited {
+				select {
+				case crunErr = <-crunDone:
+					crunExited = true
+				case <-time.After(cloneReadyTimeout):
+					tforkAbortCrunCmd(crunCmd, src, bundleDir, copies)
+					crunAborted = true
+					return nil, fmt.Errorf("timeout waiting %s for crun tfork to finish after %d clones came up; see %s",
+						cloneReadyTimeout, copies, logPath)
 				}
 			}
-			if readyCopies >= copies && stateReady {
-				break
-			}
-			if crunExited && readyCopies < copies {
-				tforkAbortCrunCmd(crunCmd, src, bundleDir, copies)
-				crunAborted = true
-				return nil, fmt.Errorf("crun tfork exited before %d clones came up (got %d); see %s",
-					copies, readyCopies, logPath)
-			}
-			if time.Now().After(deadline) {
-				tforkAbortCrunCmd(crunCmd, src, bundleDir, copies)
-				crunAborted = true
-				return nil, fmt.Errorf("timeout waiting for %d tfork.pid* files in %s (got %d, stateReady=%v); see %s",
-					copies, imgDir, readyCopies, stateReady, logPath)
-			}
-			time.Sleep(tforkClonePollInterval)
 		}
-		if !crunExited {
-			select {
-			case crunErr = <-crunDone:
-				crunExited = true
-			case <-time.After(cloneReadyTimeout):
-				tforkAbortCrunCmd(crunCmd, src, bundleDir, copies)
-				crunAborted = true
-				return nil, fmt.Errorf("timeout waiting %s for crun tfork to finish after %d clones came up; see %s",
-					cloneReadyTimeout, copies, logPath)
-			}
+		if purgeErr := waitSocketPurge(); purgeErr != nil {
+			tforkAbortCrunCmd(crunCmd, src, bundleDir, copies)
+			crunAborted = true
+			return nil, fmt.Errorf("purge clone sockets before restore: %w", purgeErr)
 		}
 		if crunErr != nil {
 			tforkAbortCrunCmd(crunCmd, src, bundleDir, copies)
@@ -665,27 +932,66 @@ func (ic *ContainerEngine) containerCloneLive(ctx context.Context, opts entities
 		}
 		logrus.Infof("tfork: batch %s up (N=%d); crun-tfork.log at %s", batchID, copies, logPath)
 	}
+	if err := tforkInjectFault("after_restore"); err != nil {
+		return nil, err
+	}
+	if len(preparedSourceFileInjections) > 0 {
+		srcPID, err := src.PID()
+		if err != nil {
+			return nil, fmt.Errorf("read frozen source PID for file rotation: %w", err)
+		}
+		if err := tforkInstallPreparedFileInjections(srcPID, preparedSourceFileInjections, nil); err != nil {
+			return nil, fmt.Errorf("rotate files in frozen source: %w", err)
+		}
+		sourceInjectionCommitted = true
+		logrus.Infof("tfork: committed %d source file rotation(s); later clone rollback will retain them",
+			len(preparedSourceFileInjections))
+	}
 
-	if err := thawSource(); err != nil {
+	if err := txn.restoreSourceOnce(); err != nil {
 		logrus.Warnf("tfork: clones are up, but thawing source cgroup after restore failed: %v", err)
 		return nil, fmt.Errorf("thaw source cgroup after tfork restore: %w", err)
 	}
-	sourceThawed = true
+	if err := tforkInjectFault("after_thaw"); err != nil {
+		return nil, err
+	}
+	srcPID, err := src.PID()
+	if err != nil {
+		return nil, fmt.Errorf("read source PID after restore: %w", err)
+	}
+	if err := tforkPIDRunning(srcPID); err != nil {
+		return nil, fmt.Errorf("source is not usable after tfork restore: %w", err)
+	}
 
 	srcCfg := src.Config()
 	if srcCfg == nil {
 		return nil, fmt.Errorf("source %q: could not read libpod config", src.ID())
 	}
 	visibleCloneIDs := make([]string, 0, requestedCopies)
+	visibleClones := make([]entities.TforkCloneMetadata, 0, requestedCopies)
 	for i, cloneID := range cloneIDs {
 		clonePID, err := readTforkClonePID(cloneID, imgDir, i, copies, useNcopyRestore)
 		if err != nil {
 			return nil, fmt.Errorf("read clone %d PID: %w", i, err)
 		}
+		txn.trackPID(clonePID, fmt.Sprintf("clone-init-%d", i))
+		if err := tforkPIDRunning(clonePID); err != nil {
+			return nil, fmt.Errorf("clone %d is not running before publication: %w", i, err)
+		}
+		clonePIDStartTime, err := libpod.ReadProcStartTime(clonePID)
+		if err != nil {
+			return nil, fmt.Errorf("read clone %d PID start time: %w", i, err)
+		}
+		for _, injection := range fileInjections[i] {
+			if err := tforkInjectFileIntoProcessRoot(clonePID, injection); err != nil {
+				return nil, fmt.Errorf("inject clone %d file %s: %w", i, injection.destination, err)
+			}
+		}
 		cloneCfg, err := buildCloneContainerConfig(srcCfg, cloneID, cloneNames[i], cloneRootfsList[i], cloneSpecs[i])
 		if err != nil {
 			return nil, fmt.Errorf("build clone %d config: %w", i, err)
 		}
+		cloneCfg.TforkInitPIDStartTime = clonePIDStartTime
 		if len(srcCfg.PortMappings) > 0 {
 			clonePorts, err := buildClonePortMappings(srcCfg.PortMappings)
 			if err != nil {
@@ -715,16 +1021,17 @@ func (ic *ContainerEngine) containerCloneLive(ctx context.Context, opts entities
 		if err != nil {
 			return nil, fmt.Errorf("register clone %d (%s) in libpod state: %w", i, cloneID, err)
 		}
+		txn.addRegistered(ctr)
 		if opts.TforkOverlayBtrfs {
 			tforkFreezeUpperForRollback(bundleDir, i, copies)
 		}
 		if cloneConmonPids[i] > 0 {
 			if err := ctr.SetConmonPID(cloneConmonPids[i]); err != nil {
-				logrus.Warnf("tfork: clone %s SetConmonPID(%d): %v", cloneID, cloneConmonPids[i], err)
+				return nil, fmt.Errorf("clone %s SetConmonPID(%d): %w", cloneID, cloneConmonPids[i], err)
 			}
 		}
 		if err := ic.Libpod.SetupExternalCloneNetwork(src, ctr, clonePID); err != nil {
-			logrus.Warnf("tfork: clone %s network setup failed (clone has no network): %v", cloneID, err)
+			return nil, fmt.Errorf("clone %s network setup: %w", cloneID, err)
 		}
 		if cmd := exec.Command("nsenter",
 			"-t", strconv.Itoa(clonePID), "-n", "--",
@@ -735,18 +1042,385 @@ func (ic *ContainerEngine) containerCloneLive(ctx context.Context, opts entities
 			}
 		}
 		if err := ctr.MoveExternalCloneToOwnCgroup(clonePID); err != nil {
-			logrus.Warnf("tfork: clone %s F8 cgroup migration failed: %v (clone shares source's cgroup)", cloneID, err)
+			return nil, fmt.Errorf("clone %s cgroup migration: %w", cloneID, err)
 		}
 		if cloneConmonPids[i] == 0 {
-			if err := spawnTforkExitWatcher(ctx, ic.Libpod, ctr, clonePID); err != nil {
-				logrus.Warnf("tfork: clone %s exit-watcher spawn: %v (podman will fall back to F4.2 /proc liveness check)", cloneID, err)
+			watcherPID, err := spawnTforkExitWatcher(ctx, ic.Libpod, ctr, clonePID)
+			if err != nil {
+				return nil, fmt.Errorf("tfork: clone %s exit-watcher spawn: %w", cloneID, err)
 			}
+			txn.trackPID(watcherPID, fmt.Sprintf("exit-watcher-%d", i))
+		}
+		if err := tforkPIDRunning(clonePID); err != nil {
+			return nil, fmt.Errorf("clone %d died during publication: %w", i, err)
+		}
+		if err := tforkInjectFault(fmt.Sprintf("after_register_%d", i)); err != nil {
+			return nil, err
 		}
 		logrus.Infof("tfork: clone %s (%s) registered in libpod state, pid=%d", cloneID, cloneNames[i], clonePID)
 		visibleCloneIDs = append(visibleCloneIDs, cloneID)
+		visibleClones = append(visibleClones, entities.TforkCloneMetadata{
+			ID:     cloneID,
+			Name:   cloneNames[i],
+			PID:    clonePID,
+			Rootfs: cloneRootfsList[i],
+		})
 	}
 
-	return &entities.ContainerCreateReport{Id: strings.Join(visibleCloneIDs, "\n")}, nil
+	if err := tforkInjectFault("before_commit"); err != nil {
+		return nil, err
+	}
+	txn.commit()
+	return &entities.ContainerCreateReport{
+		Id:          strings.Join(visibleCloneIDs, "\n"),
+		TforkClones: visibleClones,
+	}, nil
+}
+
+type tforkFileInjection struct {
+	source      string
+	destination string
+}
+
+const tforkMaximumInjectionSize = 1 << 20
+
+type tforkPreparedFileInjection struct {
+	source      string
+	destination string
+	payload     []byte
+}
+
+type tforkStagedFileInjection struct {
+	parent               *os.File
+	destination          string
+	temporary            string
+	backup               string
+	existed              bool
+	originalMoved        bool
+	replacementInstalled bool
+}
+
+func tforkParseFileInjections(specs []string, copies int) (map[int][]tforkFileInjection, error) {
+	parsed := make(map[int][]tforkFileInjection)
+	for _, spec := range specs {
+		parts := strings.SplitN(spec, ":", 3)
+		if len(parts) != 3 {
+			return nil, fmt.Errorf("invalid --tfork-inject-file %q (expected COPY_INDEX:HOST_PATH:CONTAINER_PATH)", spec)
+		}
+		copyIndex, err := strconv.Atoi(parts[0])
+		if err != nil || copyIndex < 0 || copyIndex >= copies {
+			return nil, fmt.Errorf("invalid --tfork-inject-file copy index %q for %d copies", parts[0], copies)
+		}
+		source := filepath.Clean(parts[1])
+		destination := filepath.Clean(parts[2])
+		if !filepath.IsAbs(source) || source == string(os.PathSeparator) {
+			return nil, fmt.Errorf("tfork injection source must be a non-root absolute path: %q", parts[1])
+		}
+		if !filepath.IsAbs(destination) || destination == string(os.PathSeparator) {
+			return nil, fmt.Errorf("tfork injection destination must be a non-root absolute path: %q", parts[2])
+		}
+		parsed[copyIndex] = append(parsed[copyIndex], tforkFileInjection{
+			source:      source,
+			destination: destination,
+		})
+	}
+	return parsed, nil
+}
+
+func tforkParseSourceFileInjections(specs []string) ([]tforkFileInjection, error) {
+	parsed := make([]tforkFileInjection, 0, len(specs))
+	seenDestinations := make(map[string]struct{}, len(specs))
+	for _, spec := range specs {
+		parts := strings.SplitN(spec, ":", 2)
+		if len(parts) != 2 {
+			return nil, fmt.Errorf("invalid --tfork-inject-source-file %q (expected HOST_PATH:CONTAINER_PATH)", spec)
+		}
+		source := filepath.Clean(parts[0])
+		destination := filepath.Clean(parts[1])
+		if !filepath.IsAbs(source) || source == string(os.PathSeparator) {
+			return nil, fmt.Errorf("tfork source injection source must be a non-root absolute path: %q", parts[0])
+		}
+		if !filepath.IsAbs(destination) || destination == string(os.PathSeparator) {
+			return nil, fmt.Errorf("tfork source injection destination must be a non-root absolute path: %q", parts[1])
+		}
+		if _, exists := seenDestinations[destination]; exists {
+			return nil, fmt.Errorf("duplicate tfork source injection destination %q", destination)
+		}
+		seenDestinations[destination] = struct{}{}
+		parsed = append(parsed, tforkFileInjection{source: source, destination: destination})
+	}
+	return parsed, nil
+}
+
+func tforkReadInjectionSource(path string) ([]byte, error) {
+	sourceFD, err := unix.Open(path, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	if err != nil {
+		return nil, fmt.Errorf("open source %s: %w", path, err)
+	}
+	source := os.NewFile(uintptr(sourceFD), path)
+	defer source.Close()
+	info, err := source.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("stat source %s: %w", path, err)
+	}
+	if !info.Mode().IsRegular() || info.Size() > tforkMaximumInjectionSize {
+		return nil, fmt.Errorf("source must be a regular file no larger than %d bytes", tforkMaximumInjectionSize)
+	}
+	payload, err := io.ReadAll(io.LimitReader(source, tforkMaximumInjectionSize+1))
+	if err != nil {
+		return nil, fmt.Errorf("read source %s: %w", path, err)
+	}
+	if len(payload) > tforkMaximumInjectionSize {
+		return nil, fmt.Errorf("source grew beyond %d bytes while being read", tforkMaximumInjectionSize)
+	}
+	return payload, nil
+}
+
+func tforkPrepareFileInjections(injections []tforkFileInjection) ([]tforkPreparedFileInjection, error) {
+	prepared := make([]tforkPreparedFileInjection, 0, len(injections))
+	for _, injection := range injections {
+		payload, err := tforkReadInjectionSource(injection.source)
+		if err != nil {
+			return nil, err
+		}
+		prepared = append(prepared, tforkPreparedFileInjection{
+			source:      injection.source,
+			destination: injection.destination,
+			payload:     payload,
+		})
+	}
+	return prepared, nil
+}
+
+func tforkInjectionTemporaryNames(parentFD int) (string, string, error) {
+	for attempt := 0; attempt < 16; attempt++ {
+		id := stringid.GenerateRandomID()
+		if len(id) > 16 {
+			id = id[:16]
+		}
+		temporary := ".tfork-inject-new-" + id
+		backup := ".tfork-inject-old-" + id
+		var stat unix.Stat_t
+		if err := unix.Fstatat(parentFD, temporary, &stat, unix.AT_SYMLINK_NOFOLLOW); !errors.Is(err, unix.ENOENT) {
+			if err != nil {
+				return "", "", fmt.Errorf("check temporary injection path: %w", err)
+			}
+			continue
+		}
+		if err := unix.Fstatat(parentFD, backup, &stat, unix.AT_SYMLINK_NOFOLLOW); !errors.Is(err, unix.ENOENT) {
+			if err != nil {
+				return "", "", fmt.Errorf("check backup injection path: %w", err)
+			}
+			continue
+		}
+		return temporary, backup, nil
+	}
+	return "", "", fmt.Errorf("cannot allocate unique source injection paths")
+}
+
+func tforkStagePreparedFileInjection(root string, injection tforkPreparedFileInjection) (*tforkStagedFileInjection, error) {
+	parent, err := pathrs.OpenInRoot(root, filepath.Dir(injection.destination))
+	if err != nil {
+		return nil, fmt.Errorf("open destination parent for %s: %w", injection.destination, err)
+	}
+	parentFD := int(parent.Fd())
+	stage := &tforkStagedFileInjection{
+		parent:      parent,
+		destination: filepath.Base(injection.destination),
+	}
+	var existing unix.Stat_t
+	err = unix.Fstatat(parentFD, stage.destination, &existing, unix.AT_SYMLINK_NOFOLLOW)
+	if err == nil {
+		if existing.Mode&unix.S_IFMT != unix.S_IFREG {
+			parent.Close()
+			return nil, fmt.Errorf("destination %s exists and is not a regular file", injection.destination)
+		}
+		stage.existed = true
+	} else if !errors.Is(err, unix.ENOENT) {
+		parent.Close()
+		return nil, fmt.Errorf("stat destination %s: %w", injection.destination, err)
+	}
+
+	stage.temporary, stage.backup, err = tforkInjectionTemporaryNames(parentFD)
+	if err != nil {
+		parent.Close()
+		return nil, err
+	}
+	temporaryFD, err := unix.Openat(parentFD, stage.temporary,
+		unix.O_WRONLY|unix.O_CREAT|unix.O_EXCL|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0o600)
+	if err != nil {
+		parent.Close()
+		return nil, fmt.Errorf("create temporary injection file for %s: %w", injection.destination, err)
+	}
+	temporary := os.NewFile(uintptr(temporaryFD), stage.temporary)
+	failed := true
+	defer func() {
+		if failed {
+			temporary.Close()
+			_ = unix.Unlinkat(parentFD, stage.temporary, 0)
+			parent.Close()
+		}
+	}()
+	if n, err := temporary.Write(injection.payload); err != nil {
+		return nil, fmt.Errorf("write temporary injection file for %s: %w", injection.destination, err)
+	} else if n != len(injection.payload) {
+		return nil, fmt.Errorf("write temporary injection file for %s: %w", injection.destination, io.ErrShortWrite)
+	}
+	if stage.existed {
+		var temporaryStat unix.Stat_t
+		if err := unix.Fstat(temporaryFD, &temporaryStat); err != nil {
+			return nil, fmt.Errorf("stat temporary injection file for %s: %w", injection.destination, err)
+		}
+		if temporaryStat.Uid != existing.Uid || temporaryStat.Gid != existing.Gid {
+			if err := unix.Fchown(temporaryFD, int(existing.Uid), int(existing.Gid)); err != nil {
+				return nil, fmt.Errorf("preserve ownership for %s: %w", injection.destination, err)
+			}
+		}
+	}
+	if err := unix.Fchmod(temporaryFD, 0o600); err != nil {
+		return nil, fmt.Errorf("chmod temporary injection file for %s: %w", injection.destination, err)
+	}
+	if err := temporary.Close(); err != nil {
+		return nil, fmt.Errorf("close temporary injection file for %s: %w", injection.destination, err)
+	}
+	failed = false
+	return stage, nil
+}
+
+func tforkCloseStagedFileInjections(staged []*tforkStagedFileInjection) {
+	for _, stage := range staged {
+		if stage.parent != nil {
+			stage.parent.Close()
+			stage.parent = nil
+		}
+	}
+}
+
+func tforkRemoveStagedTemporaryFiles(staged []*tforkStagedFileInjection) {
+	for _, stage := range staged {
+		if stage.parent != nil && stage.temporary != "" {
+			_ = unix.Unlinkat(int(stage.parent.Fd()), stage.temporary, 0)
+		}
+	}
+}
+
+func tforkRollbackInstalledFileInjections(staged []*tforkStagedFileInjection) error {
+	var rollbackErrors []error
+	for i := len(staged) - 1; i >= 0; i-- {
+		stage := staged[i]
+		parentFD := int(stage.parent.Fd())
+		if stage.originalMoved {
+			if err := unix.Renameat(parentFD, stage.backup, parentFD, stage.destination); err != nil {
+				rollbackErrors = append(rollbackErrors,
+					fmt.Errorf("restore original %s: %w", stage.destination, err))
+			} else {
+				stage.originalMoved = false
+				stage.replacementInstalled = false
+			}
+		} else if stage.replacementInstalled {
+			if err := unix.Unlinkat(parentFD, stage.destination, 0); err != nil && !errors.Is(err, unix.ENOENT) {
+				rollbackErrors = append(rollbackErrors,
+					fmt.Errorf("remove new destination %s: %w", stage.destination, err))
+			} else {
+				stage.replacementInstalled = false
+			}
+		}
+	}
+	return errors.Join(rollbackErrors...)
+}
+
+func tforkInstallPreparedFileInjections(pid int, injections []tforkPreparedFileInjection, afterCommit func(int) error) error {
+	root := filepath.Join("/proc", strconv.Itoa(pid), "root")
+	staged := make([]*tforkStagedFileInjection, 0, len(injections))
+	for _, injection := range injections {
+		stage, err := tforkStagePreparedFileInjection(root, injection)
+		if err != nil {
+			tforkRemoveStagedTemporaryFiles(staged)
+			tforkCloseStagedFileInjections(staged)
+			return err
+		}
+		staged = append(staged, stage)
+	}
+	defer tforkCloseStagedFileInjections(staged)
+
+	for i, stage := range staged {
+		parentFD := int(stage.parent.Fd())
+		if stage.existed {
+			if err := unix.Renameat(parentFD, stage.destination, parentFD, stage.backup); err != nil {
+				rollbackErr := tforkRollbackInstalledFileInjections(staged)
+				tforkRemoveStagedTemporaryFiles(staged)
+				return errors.Join(fmt.Errorf("backup destination %s: %w", stage.destination, err), rollbackErr)
+			}
+			stage.originalMoved = true
+		}
+		if err := unix.Renameat(parentFD, stage.temporary, parentFD, stage.destination); err != nil {
+			rollbackErr := tforkRollbackInstalledFileInjections(staged)
+			tforkRemoveStagedTemporaryFiles(staged)
+			return errors.Join(fmt.Errorf("install destination %s: %w", stage.destination, err), rollbackErr)
+		}
+		stage.replacementInstalled = true
+		if afterCommit != nil {
+			if err := afterCommit(i); err != nil {
+				rollbackErr := tforkRollbackInstalledFileInjections(staged)
+				tforkRemoveStagedTemporaryFiles(staged)
+				return errors.Join(err, rollbackErr)
+			}
+		}
+	}
+
+	for _, stage := range staged {
+		if stage.originalMoved {
+			if err := unix.Unlinkat(int(stage.parent.Fd()), stage.backup, 0); err != nil {
+				logrus.Warnf("tfork: remove committed source injection backup %s: %v", stage.backup, err)
+			}
+			stage.originalMoved = false
+		}
+	}
+	return nil
+}
+
+// New destination files inherit Podman's filesystem UID/GID, while an existing
+// destination retains its ownership. All destinations are forced to mode 0600;
+// this interface intentionally does not provide ownership or mode overrides.
+func tforkInjectFileIntoProcessRoot(pid int, injection tforkFileInjection) error {
+	sourceFD, err := unix.Open(injection.source, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	if err != nil {
+		return fmt.Errorf("open source %s: %w", injection.source, err)
+	}
+	source := os.NewFile(uintptr(sourceFD), injection.source)
+	defer source.Close()
+	info, err := source.Stat()
+	if err != nil {
+		return fmt.Errorf("stat source %s: %w", injection.source, err)
+	}
+	if !info.Mode().IsRegular() || info.Size() > tforkMaximumInjectionSize {
+		return fmt.Errorf("source must be a regular file no larger than %d bytes", tforkMaximumInjectionSize)
+	}
+
+	root := filepath.Join("/proc", strconv.Itoa(pid), "root")
+	parent, err := pathrs.OpenInRoot(root, filepath.Dir(injection.destination))
+	if err != nil {
+		return fmt.Errorf("open destination parent: %w", err)
+	}
+	defer parent.Close()
+	destinationFD, err := unix.Openat(
+		int(parent.Fd()),
+		filepath.Base(injection.destination),
+		unix.O_WRONLY|unix.O_CREAT|unix.O_TRUNC|unix.O_CLOEXEC|unix.O_NOFOLLOW,
+		0o600,
+	)
+	if err != nil {
+		return fmt.Errorf("open destination: %w", err)
+	}
+	destination := os.NewFile(uintptr(destinationFD), injection.destination)
+	defer destination.Close()
+	if err := destination.Chmod(0o600); err != nil {
+		return fmt.Errorf("chmod destination: %w", err)
+	}
+	if _, err := io.Copy(destination, source); err != nil {
+		return fmt.Errorf("copy payload: %w", err)
+	}
+	return nil
 }
 
 type tforkCgroupFreezer struct {
@@ -946,23 +1620,40 @@ func spawnTforkDumpdHolder() (int, uint64, error) {
 
 func tforkAbortCrunCmd(crunCmd *exec.Cmd, src *libpod.Container, bundleDir string, copies int) {
 	if crunCmd != nil && crunCmd.Process != nil {
-		toKill := tforkCollectDescendants(crunCmd.Process.Pid)
-		toKill = append(toKill, crunCmd.Process.Pid)
-		for _, pid := range toKill {
-			_ = syscall.Kill(pid, syscall.SIGKILL)
+		protected := make(map[int]bool)
+		if src != nil {
+			if srcPID, err := src.PID(); err == nil && srcPID > 0 {
+				protected[srcPID] = true
+				for _, pid := range tforkCollectDescendants(srcPID) {
+					protected[pid] = true
+				}
+			}
 		}
-		done := make(chan struct{})
-		go func() {
-			_, _ = crunCmd.Process.Wait()
-			close(done)
-		}()
-		select {
-		case <-done:
-		case <-time.After(3 * time.Second):
-			logrus.Warnf("tfork: crun-tfork didn't exit in 3s after SIGKILL — source may still be ptraced")
+		toKill := tforkCollectDescendants(crunCmd.Process.Pid)
+		// Give CRIU's service and restore helpers a chance to unwind ptrace,
+		// parasite, namespace, and cgyard state before killing their parent.
+		// Never signal a source-tree PID even if transient reparenting makes it
+		// appear below the runtime.
+		for i := len(toKill) - 1; i >= 0; i-- {
+			if !protected[toKill[i]] {
+				_ = syscall.Kill(toKill[i], syscall.SIGTERM)
+			}
+		}
+		if !tforkWaitPIDGone(crunCmd.Process.Pid, time.Second) {
+			for i := len(toKill) - 1; i >= 0; i-- {
+				if !protected[toKill[i]] {
+					_ = syscall.Kill(toKill[i], syscall.SIGKILL)
+				}
+			}
+			_ = syscall.Kill(crunCmd.Process.Pid, syscall.SIGKILL)
+			if !tforkWaitPIDGone(crunCmd.Process.Pid, 3*time.Second) {
+				logrus.Warnf("tfork: crun-tfork didn't exit after TERM/KILL escalation — source may still be ptraced")
+			}
 		}
 		for _, pid := range tforkCollectDescendants(crunCmd.Process.Pid) {
-			_ = syscall.Kill(pid, syscall.SIGKILL)
+			if !protected[pid] {
+				_ = syscall.Kill(pid, syscall.SIGKILL)
+			}
 		}
 	}
 	if src != nil {
@@ -979,6 +1670,19 @@ func tforkAbortCrunCmd(crunCmd *exec.Cmd, src *libpod.Container, bundleDir strin
 	}
 	if bundleDir != "" {
 		tforkBestEffortBundleReap(bundleDir, copies)
+	}
+}
+
+func tforkWaitPIDGone(pid int, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for {
+		if err := syscall.Kill(pid, 0); errors.Is(err, syscall.ESRCH) {
+			return true
+		}
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 }
 
@@ -1120,9 +1824,9 @@ while True:
 	return nil
 }
 
-func spawnTforkStdioHelper(readEnd *os.File, attachSock *os.File, logPath string, tty bool) error {
+func spawnTforkStdioHelper(readEnd *os.File, attachSock *os.File, logPath string, tty bool) (int, error) {
 	if err := os.MkdirAll(filepath.Dir(logPath), 0o755); err != nil {
-		return fmt.Errorf("mkdir %s: %w", filepath.Dir(logPath), err)
+		return 0, fmt.Errorf("mkdir %s: %w", filepath.Dir(logPath), err)
 	}
 	pyCode := `import os, sys, asyncio, datetime, socket, io, traceback
 LOG_PATH = os.environ["LOG_PATH"]
@@ -1242,13 +1946,15 @@ except Exception:
 	env = append(env, fmt.Sprintf("ATTACH_FD=%d", attachFD))
 	cmd.Env = env
 	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("start stdio-helper: %w", err)
+		return 0, fmt.Errorf("start stdio-helper: %w", err)
 	}
+	pid := 0
 	if cmd.Process != nil {
+		pid = cmd.Process.Pid
 		_ = cmd.Process.Release()
 	}
 	logrus.Debugf("tfork: spawned stdio-helper for read-fd → %s (attach=%v, tty=%v)", logPath, attachSock != nil, tty)
-	return nil
+	return pid, nil
 }
 
 func boolToInt(b bool) int {
@@ -1282,10 +1988,10 @@ func allocPerCopyAttachSocket(path string) (*os.File, error) {
 	return f, nil
 }
 
-func spawnTforkExitWatcher(ctx context.Context, rt *libpod.Runtime, ctr *libpod.Container, clonePID int) error {
+func spawnTforkExitWatcher(ctx context.Context, rt *libpod.Runtime, ctr *libpod.Container, clonePID int) (int, error) {
 	exitDir := "/run/libpod/exits"
 	if err := os.MkdirAll(exitDir, 0o755); err != nil {
-		return fmt.Errorf("mkdir %s: %w", exitDir, err)
+		return 0, fmt.Errorf("mkdir %s: %w", exitDir, err)
 	}
 	exitFile := filepath.Join(exitDir, ctr.ID())
 	script := fmt.Sprintf(`while [ -d /proc/%d ]; do sleep 0.2; done; tmp=%s.tmp; printf 137 > "$tmp" && mv "$tmp" %s`, clonePID, exitFile, exitFile)
@@ -1294,13 +2000,15 @@ func spawnTforkExitWatcher(ctx context.Context, rt *libpod.Runtime, ctr *libpod.
 	cmd.Stdout = nil
 	cmd.Stderr = nil
 	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("start exit-watcher: %w", err)
+		return 0, fmt.Errorf("start exit-watcher: %w", err)
 	}
+	pid := 0
 	if cmd.Process != nil {
+		pid = cmd.Process.Pid
 		_ = cmd.Process.Release()
 	}
 	logrus.Debugf("tfork: spawned exit-watcher for clone %s (PID %d) → %s", ctr.ID(), clonePID, exitFile)
-	return nil
+	return pid, nil
 }
 
 func readTforkClonePID(cloneID string, imgDir string, copyIdx, copies int, useNcopyRestore bool) (int, error) {
@@ -1450,6 +2158,7 @@ type conmonForTforkOpts struct {
 	ghostLimit     uint
 	tcpClose       bool
 	fullMemcopy    bool
+	networkLock    string
 	cgroupRoot     string
 	dumpdHolderPid int
 }
@@ -1674,6 +2383,10 @@ func spawnConmonForTfork(ctx context.Context, opts conmonForTforkOpts) (int, err
 	}
 	if opts.fullMemcopy {
 		tforkRuntimeOpts = append(tforkRuntimeOpts, "--tfork-full-memcopy")
+	}
+	if opts.networkLock != "" {
+		tforkRuntimeOpts = append(tforkRuntimeOpts,
+			fmt.Sprintf("--network-lock=%s", opts.networkLock))
 	}
 	if opts.cgroupRoot != "" {
 		tforkRuntimeOpts = append(tforkRuntimeOpts,
@@ -2027,6 +2740,78 @@ func tforkPurgeSockets(rootfs string) error {
 		logrus.Infof("tfork: purged %d unix socket(s) from %s", removed, rootfs)
 	}
 	return errors.Join(errs...)
+}
+
+func tforkPurgeSocketsWithManifest(rootfsList []string, manifestPath string) error {
+	if len(rootfsList) == 0 {
+		return fmt.Errorf("socket purge requires at least one clone rootfs")
+	}
+	started := time.Now()
+	rootfs := rootfsList[0]
+	socketPaths := make([]string, 0)
+	if err := filepath.WalkDir(rootfs, func(path string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return fmt.Errorf("walk %s: %w", path, walkErr)
+		}
+		if path == rootfs {
+			return nil
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return fmt.Errorf("stat %s: %w", path, err)
+		}
+		if info.Mode()&os.ModeSocket == 0 {
+			return nil
+		}
+		rel, err := filepath.Rel(rootfs, path)
+		if err != nil {
+			return fmt.Errorf("relative socket path for %s: %w", path, err)
+		}
+		clean := filepath.Clean(rel)
+		if filepath.IsAbs(clean) || clean == ".." || strings.HasPrefix(clean, ".."+string(os.PathSeparator)) {
+			return fmt.Errorf("unsafe socket path %q under %s", rel, rootfs)
+		}
+		socketPaths = append(socketPaths, clean)
+		return nil
+	}); err != nil {
+		return fmt.Errorf("walk socket manifest in %s: %w", rootfs, err)
+	}
+
+	manifest := make([]byte, 0)
+	for _, rel := range socketPaths {
+		manifest = append(manifest, rel...)
+		manifest = append(manifest, 0)
+	}
+	if err := os.WriteFile(manifestPath, manifest, 0o600); err != nil {
+		return fmt.Errorf("write socket manifest %s: %w", manifestPath, err)
+	}
+
+	for _, rel := range socketPaths {
+		for _, rootfs := range rootfsList {
+			if err := os.Remove(filepath.Join(rootfs, rel)); err != nil && !os.IsNotExist(err) {
+				return fmt.Errorf("remove socket %s from %s: %w", rel, rootfs, err)
+			}
+		}
+	}
+	logrus.Infof("tfork: socket manifest found %d path(s), applied to %d clone rootfs(es) in %s",
+		len(socketPaths), len(rootfsList), time.Since(started))
+	return nil
+}
+
+// tforkPurgeSocketsAndSignal opens the restore barrier only after every clone
+// rootfs has been purged. On any error it writes no byte, so closing barrier
+// produces EOF in crun and makes the clone transaction roll back.
+func tforkPurgeSocketsAndSignal(rootfsList []string, manifestPath string, barrier *os.File) error {
+	if barrier == nil {
+		return fmt.Errorf("socket-purge barrier is nil")
+	}
+	if err := tforkPurgeSocketsWithManifest(rootfsList, manifestPath); err != nil {
+		return err
+	}
+	if _, err := barrier.Write([]byte{1}); err != nil {
+		return fmt.Errorf("signal socket-purge completion: %w", err)
+	}
+	return nil
 }
 
 func tforkBuildSkipMnts(srcPID int) []string {

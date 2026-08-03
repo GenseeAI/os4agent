@@ -56,7 +56,10 @@ enum
   OPTION_TFORK_TCP_CLOSE,
   OPTION_TFORK_SNAP_MOUNT,
   OPTION_TFORK_DUMPD_PARENT,
+  OPTION_TFORK_PRE_RESTORE_FD,
+  OPTION_TFORK_SOURCE_DETACHED_FD,
   OPTION_TFORK_FULL_MEMCOPY,
+  OPTION_NETWORK_LOCK_METHOD,
   OPTION_PID_FILE,
   OPTION_CONSOLE_SOCKET,
   OPTION_NO_PIVOT,
@@ -101,8 +104,14 @@ static struct argp_option options[]
           "dump ESTABLISHED TCP sockets as closed; the clone wakes with sockets in closed state (apps reconnect). Required for chromium / electron / any networked workload that holds long-poll connections.", 0 },
         { "tfork-dumpd-parent", OPTION_TFORK_DUMPD_PARENT, "PID", 0,
           "host-pidns PID for dumpd to reparent itself to (so `podman stop`/`rm` cleans dumpd up via its parent). Only meaningful with --tfork-memdump-async. If unset, defaults to getppid() at exec time (conmon when invoked from podman). Same-pidns is enforced by criu — pass a host PID. See ../criu/Documentation/CRIU_TFORK_RPC_PEER_DISCONNECT_LEAK.md.", 0 },
+        { "tfork-pre-restore-fd", OPTION_TFORK_PRE_RESTORE_FD, "FD", 0,
+          "block at the Phase A/Phase B boundary until one byte can be read from FD", 0 },
+        { "tfork-source-detached-fd", OPTION_TFORK_SOURCE_DETACHED_FD, "FD", 0,
+          "write one byte to FD after CRIU has safely detached from the source tree", 0 },
         { "tfork-full-memcopy", OPTION_TFORK_FULL_MEMCOPY, 0, 0,
           "ablation knob: replace anon-private vma_cherrypick CoW with a userspace physical copy of every anon page (via pread from /proc/<source>/mem in the restorer). File-backed VMAs, memfds, and SysV IPC are unaffected. For measuring the anon-CoW signal vs full-copy baseline.", 0 },
+        { "network-lock", OPTION_NETWORK_LOCK_METHOD, "METHOD", 0,
+          "network lock backend: 'iptables', 'nftables', or 'skip'", 0 },
         { "cgroup-root", OPTION_CGROUP_ROOT, "[CTRL:]PATH", 0,
           "rewrite dumped cgroup paths under PATH on restore. Under tfork the rewrite synthesizes cgns_prefix so prepare_cgns() unshares CLONE_NEWCGROUP at the clone's own cgroup boundary. Required for recursive clone-of-clone (gen-1 → gen-2) so /proc/self/cgroup reads `/` inside gen-1.", 0 },
         { "pid-file", OPTION_PID_FILE, "FILE", 0, "where to write the PID of the container", 0 },
@@ -189,8 +198,35 @@ parse_opt (int key, char *arg, struct argp_state *state)
       }
       break;
 
+    case OPTION_TFORK_PRE_RESTORE_FD:
+      {
+        char *endp;
+        const char *p = argp_mandatory_argument (arg, state);
+        long val = strtol (p, &endp, 10);
+        if (*endp != '\0' || val < 0 || val > INT_MAX)
+          libcrun_fail_with_error (0, "--tfork-pre-restore-fd: invalid FD `%s`", p);
+        cr_options.tfork_pre_restore_fd = (int) val;
+      }
+      break;
+
+    case OPTION_TFORK_SOURCE_DETACHED_FD:
+      {
+        char *endp;
+        const char *p = argp_mandatory_argument (arg, state);
+        long val = strtol (p, &endp, 10);
+        if (*endp != '\0' || val < 0 || val > INT_MAX)
+          libcrun_fail_with_error (0, "--tfork-source-detached-fd: invalid FD `%s`", p);
+        cr_options.tfork_source_detached_fd = (int) val;
+      }
+      break;
+
     case OPTION_TFORK_FULL_MEMCOPY:
       cr_options.tfork_full_memcopy = true;
+      break;
+
+    case OPTION_NETWORK_LOCK_METHOD:
+      cr_options.network_lock_method
+          = crun_parse_network_lock_method (argp_mandatory_argument (arg, state));
       break;
 
     case OPTION_TRACK_MEM:
@@ -360,6 +396,8 @@ crun_command_tfork (struct crun_global_arguments *global_args, int argc, char **
 {
   cr_options.manage_cgroups_mode = -1;
   cr_options.tfork_copies = 0;
+  cr_options.tfork_pre_restore_fd = -1;
+  cr_options.tfork_source_detached_fd = -1;
   /*
    * External Unix stream sockets can make Codex/tmux stacks dumpable, but they
    * may hide unsupported socket topology. Keep the default fail-loud and expose

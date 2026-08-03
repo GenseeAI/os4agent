@@ -97,6 +97,10 @@ int close_service_fd(int type)
 	return 0;
 }
 
+void invalidate_proc_self_fd(void)
+{
+}
+
 void compel_log_init(int log_fn, unsigned int level)
 {
 }

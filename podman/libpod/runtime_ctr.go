@@ -150,6 +150,17 @@ func (r *Runtime) RegisterExternalContainer(ctx context.Context, rSpec *spec.Spe
 	}
 
 	ctr.valid = true
+	createdPaths := make([]string, 0, 2)
+	defer func() {
+		if retErr == nil {
+			return
+		}
+		for i := len(createdPaths) - 1; i >= 0; i-- {
+			if err := os.RemoveAll(createdPaths[i]); err != nil {
+				logrus.Errorf("Removing path for failed external container registration %s: %v", createdPaths[i], err)
+			}
+		}
+	}()
 
 	if ctr.config.StaticDir == "" {
 		sd := filepath.Join(r.config.Engine.StaticDir, "containers", ctr.ID(), "userdata")
@@ -157,11 +168,13 @@ func (r *Runtime) RegisterExternalContainer(ctx context.Context, rSpec *spec.Spe
 			return nil, fmt.Errorf("creating static dir: %w", err)
 		}
 		ctr.config.StaticDir = sd
+		createdPaths = append(createdPaths, filepath.Dir(sd))
 	}
 	rd := filepath.Join(r.storageConfig.RunRoot, "containers", ctr.ID(), "userdata")
 	if err := os.MkdirAll(rd, 0o700); err != nil {
 		return nil, fmt.Errorf("creating run dir: %w", err)
 	}
+	createdPaths = append(createdPaths, filepath.Dir(rd))
 	ctr.state.RunDir = rd
 
 	if ctr.config.ConmonPidFile == "" {

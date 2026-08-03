@@ -224,6 +224,8 @@ struct libcrun_checkpoint_restore_s
   bool track_mem;
   int tfork_copies;
   int tfork_dumpd_parent_pid;
+  int tfork_pre_restore_fd;
+  int tfork_source_detached_fd;
   unsigned int tfork_ghost_limit;
   bool tfork_full_memcopy;
 

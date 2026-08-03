@@ -32,6 +32,9 @@ static const char *action_names[ACT_MAX] = {
 	[ACT_ORPHAN_PTS_MASTER] = "orphan-pts-master",
 	[ACT_STATUS_READY] = "status-ready",
 	[ACT_QUERY_EXT_FILES] = "query-ext-files",
+	[ACT_POST_TFORK_FREEZE] = "post-tfork-freeze",
+	[ACT_PRE_TFORK_RESTORE] = "pre-tfork-restore",
+	[ACT_TFORK_SOURCE_DETACHED] = "tfork-source-detached",
 };
 
 struct script {

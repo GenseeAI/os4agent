@@ -1,7 +1,9 @@
 package containers
 
 import (
+	jsonencoding "encoding/json"
 	"fmt"
+	"os"
 
 	"github.com/containers/podman/v5/cmd/podman/common"
 	"github.com/containers/podman/v5/cmd/podman/registry"
@@ -59,6 +61,15 @@ func cloneFlags(cmd *cobra.Command) {
 	tforkOverlayBtrfsFlagName := "tfork-overlay-btrfs"
 	flags.BoolVar(&ctrClone.TforkOverlayBtrfs, tforkOverlayBtrfsFlagName, false, "use overlay-on-btrfs for per-clone rootfs (default: per-clone btrfs subvolume snapshot; overlay shares lower's page cache across siblings; requires --live)")
 
+	tforkMetadataFlagName := "tfork-metadata"
+	flags.BoolVar(&ctrClone.TforkMetadata, tforkMetadataFlagName, false, "print live-clone identity, PID, and rootfs metadata as JSON (only with --live)")
+
+	tforkInjectFileFlagName := "tfork-inject-file"
+	flags.StringSliceVar(&ctrClone.TforkInjectFiles, tforkInjectFileFlagName, nil, "inject COPY_INDEX:HOST_PATH:CONTAINER_PATH after live restore and before publication (new files use Podman's UID/GID; existing ownership is preserved; mode is forced to 0600)")
+
+	tforkInjectSourceFileFlagName := "tfork-inject-source-file"
+	flags.StringSliceVar(&ctrClone.TforkInjectSourceFiles, tforkInjectSourceFileFlagName, nil, "atomically rotate HOST_PATH:CONTAINER_PATH in the frozen source after clone restore; a committed rotation is not rolled back by later publication failure")
+
 	tforkGhostLimitFlagName := "tfork-ghost-limit"
 	flags.UintVar(&ctrClone.TforkGhostLimit, tforkGhostLimitFlagName, 256<<20, "raise CRIU's ghost-file size cap (bytes); GUI apps need >1MiB default (only with --live)")
 
@@ -67,6 +78,9 @@ func cloneFlags(cmd *cobra.Command) {
 
 	tforkFullMemcopyFlagName := "tfork-full-memcopy"
 	flags.BoolVar(&ctrClone.TforkFullMemcopy, tforkFullMemcopyFlagName, false, "ablation: physical-copy anon-private VMAs instead of CoW (for measuring the anon-CoW signal; only with --live)")
+
+	tforkNetworkLockFlagName := "tfork-network-lock"
+	flags.StringVar(&ctrClone.TforkNetworkLock, tforkNetworkLockFlagName, "nftables", "network lock backend: iptables or nftables (only with --live)")
 
 	common.DefineCreateDefaults(&ctrClone.CreateOpts)
 	common.DefineCreateFlags(cmd, &ctrClone.CreateOpts, entities.CloneMode)
@@ -140,6 +154,15 @@ func clone(cmd *cobra.Command, args []string) error {
 		if ctrClone.TforkOverlayBtrfs {
 			return fmt.Errorf("--tfork-overlay-btrfs requires --live: %w", define.ErrInvalidArg)
 		}
+		if ctrClone.TforkMetadata {
+			return fmt.Errorf("--tfork-metadata requires --live: %w", define.ErrInvalidArg)
+		}
+		if len(ctrClone.TforkInjectFiles) > 0 {
+			return fmt.Errorf("--tfork-inject-file requires --live: %w", define.ErrInvalidArg)
+		}
+		if len(ctrClone.TforkInjectSourceFiles) > 0 {
+			return fmt.Errorf("--tfork-inject-source-file requires --live: %w", define.ErrInvalidArg)
+		}
 	}
 
 	ctrClone.ID = args[0]
@@ -147,6 +170,9 @@ func clone(cmd *cobra.Command, args []string) error {
 	rep, err := registry.ContainerEngine().ContainerClone(registry.Context(), ctrClone)
 	if err != nil {
 		return err
+	}
+	if ctrClone.TforkMetadata {
+		return jsonencoding.NewEncoder(os.Stdout).Encode(rep.TforkClones)
 	}
 	fmt.Println(rep.Id)
 	return nil

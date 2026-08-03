@@ -60,6 +60,31 @@
 char *chroot_realpath (const char *chroot, const char *path, char resolved_path[]);
 
 static const char *console_socket = NULL;
+static int tfork_pre_restore_fd = -1;
+static int tfork_source_detached_fd = -1;
+
+static int
+tfork_criu_log_level (void)
+{
+  const char *override = getenv ("CRIU_TFORK_LOG_LEVEL");
+
+  /* Keep an explicit override for controlled A/B tests and emergency
+     diagnostics.  CRIU accepts levels from unconditional messages (0)
+     through debug (4). */
+  if (override != NULL && override[0] >= '0' && override[0] <= '4' && override[1] == '\0')
+    return override[0] - '0';
+
+  switch (libcrun_get_verbosity ())
+    {
+    case LIBCRUN_VERBOSITY_DEBUG:
+      return CRIU_LOG_DEBUG;
+    case LIBCRUN_VERBOSITY_WARNING:
+      return CRIU_LOG_WARN;
+    case LIBCRUN_VERBOSITY_ERROR:
+    default:
+      return CRIU_LOG_ERROR;
+    }
+}
 
 #  define LIBCRIU_MIN_VERSION 31500
 
@@ -241,6 +266,39 @@ load_wrapper (struct libcriu_wrapper_s **wrapper_out, libcrun_error_t *err)
 static int
 criu_notify (char *action, __attribute__ ((unused)) criu_notify_arg_t na)
 {
+  if (action == NULL)
+    return 0;
+
+  if (strcmp (action, "post-tfork-freeze") == 0 && tfork_pre_restore_fd >= 0)
+    {
+      char byte;
+      ssize_t n;
+
+      do
+        n = read (tfork_pre_restore_fd, &byte, 1);
+      while (n < 0 && errno == EINTR);
+      if (n != 1)
+        return -1;
+      close (tfork_pre_restore_fd);
+      tfork_pre_restore_fd = -1;
+      return 0;
+    }
+
+  if (strcmp (action, "tfork-source-detached") == 0 && tfork_source_detached_fd >= 0)
+    {
+      char byte = 1;
+      ssize_t n;
+
+      do
+        n = write (tfork_source_detached_fd, &byte, 1);
+      while (n < 0 && errno == EINTR);
+      if (n != 1)
+        return -1;
+      close (tfork_source_detached_fd);
+      tfork_source_detached_fd = -1;
+      return 0;
+    }
+
   if (strncmp (action, "orphan-pts-master", 17) == 0)
     {
       /* CRIU sends us the master FD via the 'orphan-pts-master'
@@ -1570,7 +1628,11 @@ libcrun_container_tfork_linux_criu (libcrun_container_t *container, libcrun_chec
       cr_options->work_path = cr_options->image_path;
     }
 
-  libcriu_wrapper->criu_set_log_level (4);
+  /* Tfork used to force CRIU debug logging even for a normal crun request.
+     That makes log formatting and I/O grow with every task and VMA.  Match
+     the runtime's requested verbosity; the explicit override above retains
+     full tracing for Podman's custom tfork path when needed. */
+  libcriu_wrapper->criu_set_log_level (tfork_criu_log_level ());
   libcriu_wrapper->criu_set_log_file (CRIU_TFORK_LOG_FILE);
 
   if (cr_options->tfork_ghost_limit > 0)
@@ -1681,6 +1743,13 @@ libcrun_container_tfork_linux_criu (libcrun_container_t *container, libcrun_chec
                                 "criu_set_tfork_full_memcopy (rebuild against "
                                 "a criu with --tfork-full-memcopy support)");
       libcriu_wrapper->criu_set_tfork_full_memcopy (true);
+    }
+
+  if (libcriu_wrapper->criu_set_network_lock && cr_options->network_lock_method > 0)
+    {
+      ret = libcriu_wrapper->criu_set_network_lock (cr_options->network_lock_method);
+      if (UNLIKELY (ret < 0))
+        return crun_make_error (err, 0, "CRIU: failed setting tfork network lock");
     }
 
   if (cr_options->track_mem || cr_options->tfork_memdump)
@@ -1860,7 +1929,12 @@ libcrun_container_tfork_linux_criu (libcrun_container_t *container, libcrun_chec
   if (UNLIKELY (ret < 0))
     return ret;
 
+  tfork_pre_restore_fd = cr_options->tfork_pre_restore_fd;
+  tfork_source_detached_fd = cr_options->tfork_source_detached_fd;
+  libcriu_wrapper->criu_set_notify_cb (criu_notify);
   ret = libcriu_wrapper->criu_tfork();
+  tfork_pre_restore_fd = -1;
+  tfork_source_detached_fd = -1;
   if (UNLIKELY (ret != 0))
     {
       show_criu_log (cr_options->work_path, CRIU_TFORK_LOG_FILE);

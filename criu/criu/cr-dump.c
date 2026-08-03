@@ -6,6 +6,7 @@
 #include <unistd.h>
 #include <errno.h>
 #include <string.h>
+#include <time.h>
 
 #include <fcntl.h>
 
@@ -91,6 +92,94 @@
 #include "asm/dump.h"
 #include "timer.h"
 #include "sigact.h"
+
+/*
+ * Opt-in tfork profiling.  Keep the normal path to one cached branch per
+ * timing point and aggregate per-task intervals so profiling does not add a
+ * log write for every process and operation.
+ */
+struct tfork_task_profile {
+	uint64_t task_count;
+	uint64_t total;
+	uint64_t stat_identity;
+	uint64_t mappings;
+	uint64_t fds;
+	uint64_t proc_metadata;
+	uint64_t infect;
+	uint64_t parasite_metadata;
+	uint64_t image_ids;
+	uint64_t files;
+	uint64_t pages;
+	uint64_t signal_timers;
+	uint64_t core_cgroup;
+	uint64_t stop_threads_cure;
+	uint64_t mm_fs;
+	uint64_t cleanup;
+};
+
+static struct tfork_task_profile tfork_task_profile;
+
+static bool tfork_profile_enabled(void)
+{
+	static int enabled = -1;
+	const char *value;
+
+	if (enabled >= 0)
+		return opts.tfork.active && enabled;
+
+	value = getenv("CRIU_TFORK_PROFILE");
+	enabled = value && value[0] && strcmp(value, "0");
+	return opts.tfork.active && enabled;
+}
+
+static uint64_t tfork_profile_now(void)
+{
+	struct timespec ts;
+
+	if (!tfork_profile_enabled())
+		return 0;
+	if (clock_gettime(CLOCK_MONOTONIC, &ts))
+		return 0;
+	return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+}
+
+static void tfork_profile_add(uint64_t *total, uint64_t started)
+{
+	uint64_t now;
+
+	if (!started)
+		return;
+	now = tfork_profile_now();
+	if (now >= started)
+		*total += now - started;
+}
+
+static void tfork_profile_dump_tasks(void)
+{
+	struct tfork_task_profile *p = &tfork_task_profile;
+
+	if (!tfork_profile_enabled())
+		return;
+
+#define TFORK_PROFILE_US(field) ((unsigned long long)(p->field / 1000ULL))
+	pr_info("tfork-profile: phase=A tasks=%llu task_total_us=%llu "
+		"stat_identity_us=%llu mappings_us=%llu fds_us=%llu "
+		"proc_metadata_us=%llu\n",
+		(unsigned long long)p->task_count, TFORK_PROFILE_US(total),
+		TFORK_PROFILE_US(stat_identity), TFORK_PROFILE_US(mappings),
+		TFORK_PROFILE_US(fds), TFORK_PROFILE_US(proc_metadata));
+	pr_info("tfork-profile: phase=A infect_us=%llu parasite_metadata_us=%llu "
+		"image_ids_us=%llu files_us=%llu pages_us=%llu "
+		"signal_timers_us=%llu\n",
+		TFORK_PROFILE_US(infect), TFORK_PROFILE_US(parasite_metadata),
+		TFORK_PROFILE_US(image_ids), TFORK_PROFILE_US(files),
+		TFORK_PROFILE_US(pages), TFORK_PROFILE_US(signal_timers));
+	pr_info("tfork-profile: phase=A core_cgroup_us=%llu "
+		"stop_threads_cure_us=%llu mm_fs_us=%llu cleanup_us=%llu\n",
+		TFORK_PROFILE_US(core_cgroup), TFORK_PROFILE_US(stop_threads_cure),
+		TFORK_PROFILE_US(mm_fs), TFORK_PROFILE_US(cleanup));
+#undef TFORK_PROFILE_US
+}
 
 /*
  * Architectures can overwrite this function to restore register sets that
@@ -885,6 +974,7 @@ static int collect_pstree_ids_predump(void)
 	 * write_img_inventory().
 	 */
 
+	pid_init_dump(crt.i.pid, &crt.i);
 	crt.i.pid->state = TASK_ALIVE;
 	crt.i.pid->real = getpid();
 
@@ -1571,6 +1661,11 @@ static int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
 	struct proc_posix_timers_stat proc_args;
 	struct mem_dump_ctl mdc;
 	unsigned long cflags;
+	uint64_t profile_task_started = tfork_profile_now();
+	uint64_t profile_started = 0;
+
+	if (profile_task_started)
+		tfork_task_profile.task_count++;
 
 	vm_area_list_init(&vmas);
 
@@ -1582,8 +1677,9 @@ static int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
 		/*
 		 * zombies are dumped separately in dump_zombies()
 		 */
-		return 0;
+		goto profiled_dead;
 
+	profile_started = tfork_profile_now();
 	pr_info("Obtaining task stat ... \n");
 	ret = parse_pid_stat(pid, &pps_buf);
 	if (ret < 0)
@@ -1640,13 +1736,17 @@ static int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
 		pr_err("Dump TIME namespace (pid: %d) failed with %d\n", pid, ret);
 		goto err;
 	}
+	tfork_profile_add(&tfork_task_profile.stat_identity, profile_started);
 
+	profile_started = tfork_profile_now();
 	ret = collect_mappings(pid, &vmas, dump_filemap);
 	if (ret) {
 		pr_err("Collect mappings (pid: %d) failed with %d\n", pid, ret);
 		goto err;
 	}
+	tfork_profile_add(&tfork_task_profile.mappings, profile_started);
 
+	profile_started = tfork_profile_now();
 	if (!shared_fdtable(item)) {
 		dfds = xmalloc(sizeof(*dfds));
 		if (!dfds)
@@ -1660,7 +1760,9 @@ static int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
 
 		parasite_ensure_args_size(drain_fds_size(dfds));
 	}
+	tfork_profile_add(&tfork_task_profile.fds, profile_started);
 
+	profile_started = tfork_profile_now();
 	ret = parse_posix_timers(pid, &proc_args);
 	if (ret < 0) {
 		pr_err("Can't read posix timers file (pid: %d)\n", pid);
@@ -1680,12 +1782,15 @@ static int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
 		pr_err("Dump %d rseq failed %d\n", pid, ret);
 		goto err;
 	}
+	tfork_profile_add(&tfork_task_profile.proc_metadata, profile_started);
 
+	profile_started = tfork_profile_now();
 	parasite_ctl = parasite_infect_seized(pid, item, &vmas);
 	if (!parasite_ctl) {
 		pr_err("Can't infect (pid: %d) with parasite\n", pid);
 		goto err;
 	}
+	tfork_profile_add(&tfork_task_profile.infect, profile_started);
 
 	ret = fixup_thread_rseq(item, 0);
 	if (ret) {
@@ -1711,6 +1816,7 @@ static int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
 			goto err_cure;
 	}
 
+	profile_started = tfork_profile_now();
 	ret = parasite_fixup_vdso(parasite_ctl, pid, &vmas);
 	if (ret) {
 		pr_err("Can't fixup vdso VMAs (pid: %d)\n", pid);
@@ -1728,7 +1834,9 @@ static int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
 		pr_err("Can't dump misc (pid: %d)\n", pid);
 		goto err_cure;
 	}
+	tfork_profile_add(&tfork_task_profile.parasite_metadata, profile_started);
 
+	profile_started = tfork_profile_now();
 	cr_imgset = cr_task_imgset_open(uid(item), O_DUMP);
 	if (!cr_imgset)
 		goto err_cure;
@@ -1738,7 +1846,9 @@ static int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
 		pr_err("Dump ids (pid: %d) failed with %d\n", pid, ret);
 		goto err_cure;
 	}
+	tfork_profile_add(&tfork_task_profile.image_ids, profile_started);
 
+	profile_started = tfork_profile_now();
 	if (dfds) {
 		ret = dump_task_files_seized(parasite_ctl, item, dfds);
 		if (ret) {
@@ -1751,12 +1861,14 @@ static int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
 			goto err_cure;
 		}
 	}
+	tfork_profile_add(&tfork_task_profile.files, profile_started);
 
 	mdc.pre_dump = false;
 	mdc.lazy = opts.lazy_pages;
 	mdc.stat = &pps_buf;
 	mdc.parent_ie = parent_ie;
 
+	profile_started = tfork_profile_now();
 	if (!opts.tfork.active) {
 		ret = parasite_dump_pages_seized(item, &vmas, &mdc, parasite_ctl);
 		if (ret)
@@ -1769,7 +1881,9 @@ static int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
 		if (ret)
 			goto err_cure;
 	}
+	tfork_profile_add(&tfork_task_profile.pages, profile_started);
 
+	profile_started = tfork_profile_now();
 	ret = parasite_dump_sigacts_seized(parasite_ctl, item);
 	if (ret) {
 		pr_err("Can't dump sigactions (pid: %d) with parasite\n", pid);
@@ -1787,7 +1901,9 @@ static int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
 		pr_err("Can't dump posix timers (pid: %d)\n", pid);
 		goto err_cure;
 	}
+	tfork_profile_add(&tfork_task_profile.signal_timers, profile_started);
 
+	profile_started = tfork_profile_now();
 	ret = dump_task_core_all(parasite_ctl, item, &pps_buf, cr_imgset, &misc);
 	if (ret) {
 		pr_err("Dump core (pid: %d) failed with %d\n", pid, ret);
@@ -1799,7 +1915,9 @@ static int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
 		pr_err("Dump cgroup of threads in process (pid: %d) failed with %d\n", pid, ret);
 		goto err_cure;
 	}
+	tfork_profile_add(&tfork_task_profile.core_cgroup, profile_started);
 
+	profile_started = tfork_profile_now();
 	ret = compel_stop_daemon(parasite_ctl);
 	if (ret) {
 		pr_err("Can't stop daemon in parasite (pid: %d)\n", pid);
@@ -1824,7 +1942,9 @@ static int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
 		pr_err("Can't cure (pid: %d) from parasite\n", pid);
 		goto err;
 	}
+	tfork_profile_add(&tfork_task_profile.stop_threads_cure, profile_started);
 
+	profile_started = tfork_profile_now();
 	ret = dump_task_mm(pid, &pps_buf, &misc, &vmas, cr_imgset);
 	if (ret) {
 		pr_err("Dump mappings (pid: %d) failed with %d\n", pid, ret);
@@ -1836,13 +1956,17 @@ static int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
 		pr_err("Dump fs (pid: %d) failed with %d\n", pid, ret);
 		goto err;
 	}
+	tfork_profile_add(&tfork_task_profile.mm_fs, profile_started);
 
 	exit_code = 0;
 err:
+	profile_started = tfork_profile_now();
 	close_cr_imgset(&cr_imgset);
 	close_pid_proc();
 	free_mappings(&vmas);
 	xfree(dfds);
+	tfork_profile_add(&tfork_task_profile.cleanup, profile_started);
+	tfork_profile_add(&tfork_task_profile.total, profile_task_started);
 	return exit_code;
 
 err_cure:
@@ -1850,6 +1974,10 @@ err_cure:
 	if (ret)
 		pr_err("Can't cure (pid: %d) from parasite\n", pid);
 	goto err;
+
+profiled_dead:
+	tfork_profile_add(&tfork_task_profile.total, profile_task_started);
+	return 0;
 }
 
 static int alarm_attempts = 0;
@@ -2323,9 +2451,12 @@ int cr_dump_tasks(pid_t pid)
 	if (collect_and_suspend_lsm() < 0)
 		goto err;
 
+	if (tfork_profile_enabled())
+		memset(&tfork_task_profile, 0, sizeof(tfork_task_profile));
 	for_each_pstree_item(item)
 		if (dump_one_task(item, parent_ie))
 			goto err;
+	tfork_profile_dump_tasks();
 
 	if (!opts.tfork.active) {
 		ret = run_plugins(DUMP_DEVICES_LATE, pid);
