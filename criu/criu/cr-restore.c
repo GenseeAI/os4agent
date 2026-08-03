@@ -186,19 +186,57 @@ static int __restore_wait_inprogress_tasks(int participants)
 	int ret;
 	futex_t *np = &task_entries->nr_in_progress;
 	const int tfork_restore_wait_timeout_ms = 10000;
-	const int tfork_restore_wait_poll_us = 100000;
 
 	if (opts.tfork.active) {
-		int waited;
+		struct timespec started, now, timeout;
+		int wait_ret = 0;
 
-		for (waited = 0; waited < tfork_restore_wait_timeout_ms;
-		     waited += tfork_restore_wait_poll_us / 1000) {
-			if ((int)futex_get(np) <= participants)
+		/*
+		 * All paths that decrement this barrier use
+		 * futex_dec_and_wake().  Waiting on the observed value avoids
+		 * paying up to one 100ms polling interval at every restore stage.
+		 */
+		if (clock_gettime(CLOCK_MONOTONIC, &started)) {
+			pr_perror("tfork restore wait: clock_gettime");
+			return -errno;
+		}
+		while ((int)futex_get(np) > participants) {
+			int64_t elapsed_ns, remaining_ns;
+			uint32_t observed = futex_get(np);
+
+			if (observed & FUTEX_ABORT_FLAG)
 				break;
-			usleep(tfork_restore_wait_poll_us);
+			if (clock_gettime(CLOCK_MONOTONIC, &now)) {
+				pr_perror("tfork restore wait: clock_gettime");
+				return -errno;
+			}
+			elapsed_ns =
+				(int64_t)(now.tv_sec - started.tv_sec) * NSEC_PER_SEC +
+				(now.tv_nsec - started.tv_nsec);
+			remaining_ns =
+				(int64_t)tfork_restore_wait_timeout_ms * 1000000 -
+				elapsed_ns;
+			if (remaining_ns <= 0) {
+				wait_ret = -ETIMEDOUT;
+				break;
+			}
+			timeout.tv_sec = remaining_ns / NSEC_PER_SEC;
+			timeout.tv_nsec = remaining_ns % NSEC_PER_SEC;
+			wait_ret = sys_futex(
+				(uint32_t *)&np->raw.counter, FUTEX_WAIT,
+				observed, &timeout, NULL, 0);
+			if (wait_ret == 0 || wait_ret == -EINTR ||
+			    wait_ret == -EWOULDBLOCK)
+				continue;
+			if (wait_ret == -ETIMEDOUT)
+				break;
+			pr_err("tfork restore futex wait failed: %d\n", wait_ret);
+			set_cr_errno(-wait_ret);
+			return wait_ret;
 		}
 
-		if ((int)futex_get(np) > participants) {
+		if (wait_ret == -ETIMEDOUT &&
+		    (int)futex_get(np) > participants) {
 			pr_err("tfork restore wait timed out after %dms: participants=%d nr_in_progress=%d start_stage=%d task_cr_err=%d nr_tasks=%d nr_threads=%d nr_helpers=%d\n",
 			       tfork_restore_wait_timeout_ms,
 			       participants, (int)futex_get(np),
