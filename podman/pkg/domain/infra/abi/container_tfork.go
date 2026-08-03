@@ -396,6 +396,15 @@ func (ic *ContainerEngine) containerCloneLive(ctx context.Context, opts entities
 	default:
 		return nil, fmt.Errorf("invalid --persistent value %q (must be \"async\" or \"sync\")", opts.Persistent)
 	}
+	if opts.TforkNetworkLock == "" {
+		opts.TforkNetworkLock = "nftables"
+	}
+	switch opts.TforkNetworkLock {
+	case "iptables", "nftables":
+		crunArgs = append(crunArgs, "--network-lock", opts.TforkNetworkLock)
+	default:
+		return nil, fmt.Errorf("invalid --tfork-network-lock value %q (must be \"iptables\" or \"nftables\")", opts.TforkNetworkLock)
+	}
 	dumpdHolderPid := 0
 	var dumpdHolderStartTime uint64
 	if opts.Persistent == "async" {
@@ -488,6 +497,7 @@ func (ic *ContainerEngine) containerCloneLive(ctx context.Context, opts entities
 			ghostLimit:     opts.TforkGhostLimit,
 			tcpClose:       opts.TforkTCPClose,
 			fullMemcopy:    opts.TforkFullMemcopy,
+			networkLock:    opts.TforkNetworkLock,
 			cgroupRoot:     cloneCgroupPaths[0],
 			dumpdHolderPid: dumpdHolderPid,
 		})
@@ -1540,6 +1550,7 @@ type conmonForTforkOpts struct {
 	ghostLimit     uint
 	tcpClose       bool
 	fullMemcopy    bool
+	networkLock    string
 	cgroupRoot     string
 	dumpdHolderPid int
 }
@@ -1764,6 +1775,10 @@ func spawnConmonForTfork(ctx context.Context, opts conmonForTforkOpts) (int, err
 	}
 	if opts.fullMemcopy {
 		tforkRuntimeOpts = append(tforkRuntimeOpts, "--tfork-full-memcopy")
+	}
+	if opts.networkLock != "" {
+		tforkRuntimeOpts = append(tforkRuntimeOpts,
+			fmt.Sprintf("--network-lock=%s", opts.networkLock))
 	}
 	if opts.cgroupRoot != "" {
 		tforkRuntimeOpts = append(tforkRuntimeOpts,

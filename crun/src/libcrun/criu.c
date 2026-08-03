@@ -1683,6 +1683,13 @@ libcrun_container_tfork_linux_criu (libcrun_container_t *container, libcrun_chec
       libcriu_wrapper->criu_set_tfork_full_memcopy (true);
     }
 
+  if (libcriu_wrapper->criu_set_network_lock && cr_options->network_lock_method > 0)
+    {
+      ret = libcriu_wrapper->criu_set_network_lock (cr_options->network_lock_method);
+      if (UNLIKELY (ret < 0))
+        return crun_make_error (err, 0, "CRIU: failed setting tfork network lock");
+    }
+
   if (cr_options->track_mem || cr_options->tfork_memdump)
     libcriu_wrapper->criu_set_track_mem (true);
 

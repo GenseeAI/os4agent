@@ -57,6 +57,7 @@ enum
   OPTION_TFORK_SNAP_MOUNT,
   OPTION_TFORK_DUMPD_PARENT,
   OPTION_TFORK_FULL_MEMCOPY,
+  OPTION_NETWORK_LOCK_METHOD,
   OPTION_PID_FILE,
   OPTION_CONSOLE_SOCKET,
   OPTION_NO_PIVOT,
@@ -103,6 +104,8 @@ static struct argp_option options[]
           "host-pidns PID for dumpd to reparent itself to (so `podman stop`/`rm` cleans dumpd up via its parent). Only meaningful with --tfork-memdump-async. If unset, defaults to getppid() at exec time (conmon when invoked from podman). Same-pidns is enforced by criu — pass a host PID. See ../criu/Documentation/CRIU_TFORK_RPC_PEER_DISCONNECT_LEAK.md.", 0 },
         { "tfork-full-memcopy", OPTION_TFORK_FULL_MEMCOPY, 0, 0,
           "ablation knob: replace anon-private vma_cherrypick CoW with a userspace physical copy of every anon page (via pread from /proc/<source>/mem in the restorer). File-backed VMAs, memfds, and SysV IPC are unaffected. For measuring the anon-CoW signal vs full-copy baseline.", 0 },
+        { "network-lock", OPTION_NETWORK_LOCK_METHOD, "METHOD", 0,
+          "network lock backend: 'iptables', 'nftables', or 'skip'", 0 },
         { "cgroup-root", OPTION_CGROUP_ROOT, "[CTRL:]PATH", 0,
           "rewrite dumped cgroup paths under PATH on restore. Under tfork the rewrite synthesizes cgns_prefix so prepare_cgns() unshares CLONE_NEWCGROUP at the clone's own cgroup boundary. Required for recursive clone-of-clone (gen-1 → gen-2) so /proc/self/cgroup reads `/` inside gen-1.", 0 },
         { "pid-file", OPTION_PID_FILE, "FILE", 0, "where to write the PID of the container", 0 },
@@ -191,6 +194,11 @@ parse_opt (int key, char *arg, struct argp_state *state)
 
     case OPTION_TFORK_FULL_MEMCOPY:
       cr_options.tfork_full_memcopy = true;
+      break;
+
+    case OPTION_NETWORK_LOCK_METHOD:
+      cr_options.network_lock_method
+          = crun_parse_network_lock_method (argp_mandatory_argument (arg, state));
       break;
 
     case OPTION_TRACK_MEM:
