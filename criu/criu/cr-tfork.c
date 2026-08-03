@@ -3,6 +3,7 @@
 #include <unistd.h>
 #include <errno.h>
 #include <string.h>
+#include <time.h>
 
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -43,6 +44,51 @@
 #include "xmalloc.h"
 
 #define VMA_CHERRYPICK_FD_ENV "CRIU_VMA_CHERRYPICK_FD"
+
+static bool tfork_parent_profile;
+static uint64_t tfork_parent_profile_origin;
+static uint64_t tfork_parent_profile_last;
+
+static uint64_t tfork_parent_profile_now(void)
+{
+	struct timespec ts;
+
+	if (clock_gettime(CLOCK_MONOTONIC, &ts))
+		return 0;
+	return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+}
+
+static void tfork_parent_profile_init(void)
+{
+	const char *value = getenv("CRIU_TFORK_PROFILE");
+
+	tfork_parent_profile = value && value[0] && strcmp(value, "0");
+	if (!tfork_parent_profile)
+		return;
+	tfork_parent_profile_origin = tfork_parent_profile_now();
+	tfork_parent_profile_last = tfork_parent_profile_origin;
+}
+
+static void tfork_parent_profile_mark(const char *mark)
+{
+	uint64_t now;
+	uint64_t delta = 0;
+	uint64_t elapsed = 0;
+
+	if (!tfork_parent_profile)
+		return;
+	now = tfork_parent_profile_now();
+	if (now >= tfork_parent_profile_last) {
+		delta = now - tfork_parent_profile_last;
+		tfork_parent_profile_last = now;
+	}
+	if (now >= tfork_parent_profile_origin)
+		elapsed = now - tfork_parent_profile_origin;
+	pr_info("tfork-profile: phase=B-parent mark=%s delta_us=%llu elapsed_us=%llu\n",
+		mark,
+		(unsigned long long)(delta / 1000ULL),
+		(unsigned long long)(elapsed / 1000ULL));
+}
 
 static int tfork_dup_inherited_vma_cherrypick(int env_fd)
 {
@@ -573,6 +619,7 @@ static int cr_tfork_finish(int ret)
 {
 	int j;
 
+	tfork_parent_profile_mark("finish-enter");
 	for (j = 0; j < opts.tfork.pidfd_map_nr; j++) {
 		if (opts.tfork.pidfd_map[j].pidfd >= 0)
 			close(opts.tfork.pidfd_map[j].pidfd);
@@ -600,6 +647,7 @@ static int cr_tfork_finish(int ret)
 
 	if (bfd_flush_images())
 		ret = -1;
+	tfork_parent_profile_mark("finish-close-fds-and-flush");
 
 	cgp_fini();
 
@@ -607,6 +655,7 @@ static int cr_tfork_finish(int ret)
 	network_unlock();
 	delete_link_remaps();
 	clean_cr_time_mounts();
+	tfork_parent_profile_mark("finish-unlock-and-clean-mounts");
 
 	cr_plugin_fini(CR_PLUGIN_STAGE__DUMP, ret);
 
@@ -615,6 +664,7 @@ static int cr_tfork_finish(int ret)
 
 	pstree_switch_state(root_item, TASK_ALIVE);
 	timing_stop(TIME_FROZEN);
+	tfork_parent_profile_mark("finish-unseize-source");
 
 	seccomp_free_entries();
 	free_file_locks();
@@ -624,6 +674,7 @@ static int cr_tfork_finish(int ret)
 
 	close_service_fd(CR_PROC_FD_OFF);
 	close_image_dir();
+	tfork_parent_profile_mark("finish-free-and-close");
 
 	if (ret) {
 		pr_err("tfork FAILED.\n");
@@ -939,10 +990,12 @@ int cr_tfork_tasks(pid_t pid)
 	}
 
 	pr_info("tfork: Phase B — setting up clone restore\n");
+	tfork_parent_profile_init();
 
 	opts.tfork.vma_cherrypick_fd = tfork_open_vma_cherrypick();
 	if (opts.tfork.vma_cherrypick_fd < 0)
 		goto err;
+	tfork_parent_profile_mark("open-vma-cherrypick");
 
 	nr = 0;
 	for_each_pstree_item(item)
@@ -970,12 +1023,14 @@ int cr_tfork_tasks(pid_t pid)
 			pidfd, item->pid->real, localpid(item), uid(item),
 			item->pid->leaf_ns_id, item->pid->ns_level);
 	}
+	tfork_parent_profile_mark("pidfd-map");
 
 	ret = run_scripts(ACT_PRE_TFORK_RESTORE);
 	if (ret) {
 		pr_err("Pre-tfork-restore script failed: %d\n", ret);
 		goto err;
 	}
+	tfork_parent_profile_mark("pre-restore-hook");
 
 	img_dir_fd = get_service_fd(IMG_FD_OFF);
 	cropt_fd = openat(img_dir_fd, "tfork.cropt",
@@ -996,6 +1051,7 @@ int cr_tfork_tasks(pid_t pid)
 			opts.tfork.pidfd_map[j].vpid,
 			(int)opts.tfork.pidfd_map[j].real_pid);
 	fclose(f);
+	tfork_parent_profile_mark("write-cropt");
 
 	if (opts.output) {
 		char phasea_path[PATH_MAX];
@@ -1017,6 +1073,7 @@ int cr_tfork_tasks(pid_t pid)
 		if (dst >= 0)
 			close(dst);
 	}
+	tfork_parent_profile_mark("copy-phase-a-log");
 
 	child = fork();
 	if (child < 0) {
@@ -1024,6 +1081,8 @@ int cr_tfork_tasks(pid_t pid)
 		ret = -1;
 		goto err;
 	}
+	if (child > 0)
+		tfork_parent_profile_mark("fork-restore-child");
 
 	if (child == 0) {
 		char img_dir_arg[PATH_MAX];
@@ -1340,6 +1399,7 @@ int cr_tfork_tasks(pid_t pid)
 		       WTERMSIG(status));
 		ret = -1;
 	}
+	tfork_parent_profile_mark("wait-restore-child");
 
 err:
 	return cr_tfork_finish(ret);
