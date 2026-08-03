@@ -16,6 +16,13 @@ func TestTforkPurgeSockets(t *testing.T) {
 	socketDir := filepath.Join(rootfs, "run", "nested")
 	require.NoError(t, os.MkdirAll(socketDir, 0o755))
 
+	// Reproducing the OverlayFS inode collision requires the custom kernel and
+	// a privileged mount setup. Shadow find here so this unit test still fails
+	// with the old implementation that delegated traversal to GNU find.
+	fakeBin := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(fakeBin, "find"), []byte("#!/bin/sh\nexit 99\n"), 0o755))
+	t.Setenv("PATH", fakeBin)
+
 	socketPath := filepath.Join(socketDir, "agent.sock")
 	listener, err := net.ListenUnix("unix", &net.UnixAddr{
 		Name: socketPath,
