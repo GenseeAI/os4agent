@@ -68,7 +68,7 @@ func cloneFlags(cmd *cobra.Command) {
 	flags.StringSliceVar(&ctrClone.TforkInjectFiles, tforkInjectFileFlagName, nil, "inject COPY_INDEX:HOST_PATH:CONTAINER_PATH after live restore and before publication")
 
 	tforkInjectSourceFileFlagName := "tfork-inject-source-file"
-	flags.StringSliceVar(&ctrClone.TforkInjectSourceFiles, tforkInjectSourceFileFlagName, nil, "inject HOST_PATH:CONTAINER_PATH into the frozen source after rootfs cloning")
+	flags.StringSliceVar(&ctrClone.TforkInjectSourceFiles, tforkInjectSourceFileFlagName, nil, "atomically rotate HOST_PATH:CONTAINER_PATH in the frozen source after clone restore; a committed rotation is not rolled back by later publication failure")
 
 	tforkGhostLimitFlagName := "tfork-ghost-limit"
 	flags.UintVar(&ctrClone.TforkGhostLimit, tforkGhostLimitFlagName, 256<<20, "raise CRIU's ghost-file size cap (bytes); GUI apps need >1MiB default (only with --live)")

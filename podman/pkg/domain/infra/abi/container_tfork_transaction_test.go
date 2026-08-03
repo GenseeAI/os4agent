@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -77,6 +78,95 @@ func TestTforkParseSourceFileInjections(t *testing.T) {
 	}
 	if _, err := tforkParseSourceFileInjections([]string{"relative:/tmp/context"}); err == nil {
 		t.Fatal("expected relative source path to fail")
+	}
+	if _, err := tforkParseSourceFileInjections([]string{
+		"/tmp/source-0:/tmp/context",
+		"/tmp/source-1:/tmp/context",
+	}); err == nil {
+		t.Fatal("expected duplicate destination to fail")
+	}
+}
+
+func TestTforkInstallPreparedFileInjectionsRollsBackBatch(t *testing.T) {
+	dir := t.TempDir()
+	existing := filepath.Join(dir, "existing")
+	created := filepath.Join(dir, "created")
+	if err := os.WriteFile(existing, []byte("original"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	injections := []tforkPreparedFileInjection{
+		{source: "/host/first", destination: existing, payload: []byte("replacement")},
+		{source: "/host/second", destination: created, payload: []byte("new")},
+	}
+	wantFailure := errors.New("fail after second commit")
+	err := tforkInstallPreparedFileInjections(os.Getpid(), injections, func(index int) error {
+		if index == 1 {
+			return wantFailure
+		}
+		return nil
+	})
+	if !errors.Is(err, wantFailure) {
+		t.Fatalf("install error = %v; want %v", err, wantFailure)
+	}
+	data, err := os.ReadFile(existing)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := string(data), "original"; got != want {
+		t.Fatalf("existing content = %q; want %q", got, want)
+	}
+	if info, err := os.Stat(existing); err != nil {
+		t.Fatal(err)
+	} else if got, want := info.Mode().Perm(), os.FileMode(0o640); got != want {
+		t.Fatalf("existing mode = %o; want %o", got, want)
+	}
+	if _, err := os.Stat(created); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("new destination survived rollback: %v", err)
+	}
+	assertNoTforkInjectionTemporaryFiles(t, dir)
+}
+
+func TestTforkInstallPreparedFileInjectionsCommitsBatch(t *testing.T) {
+	dir := t.TempDir()
+	existing := filepath.Join(dir, "existing")
+	created := filepath.Join(dir, "created")
+	if err := os.WriteFile(existing, []byte("original"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	injections := []tforkPreparedFileInjection{
+		{source: "/host/first", destination: existing, payload: []byte("replacement")},
+		{source: "/host/second", destination: created, payload: []byte("new")},
+	}
+	if err := tforkInstallPreparedFileInjections(os.Getpid(), injections, nil); err != nil {
+		t.Fatal(err)
+	}
+	for path, want := range map[string]string{existing: "replacement", created: "new"} {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := string(data); got != want {
+			t.Fatalf("%s content = %q; want %q", path, got, want)
+		}
+		if info, err := os.Stat(path); err != nil {
+			t.Fatal(err)
+		} else if got, want := info.Mode().Perm(), os.FileMode(0o600); got != want {
+			t.Fatalf("%s mode = %o; want %o", path, got, want)
+		}
+	}
+	assertNoTforkInjectionTemporaryFiles(t, dir)
+}
+
+func assertNoTforkInjectionTemporaryFiles(t *testing.T, dir string) {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), ".tfork-inject-") {
+			t.Fatalf("source injection left temporary file %s", entry.Name())
+		}
 	}
 }
 
