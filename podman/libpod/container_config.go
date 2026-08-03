@@ -472,6 +472,7 @@ type ContainerMiscConfig struct {
 	TforkPersistent           string `json:"tforkPersistent,omitempty"`
 	TforkSourceID             string `json:"tforkSourceID,omitempty"`
 	TforkParentClone          string `json:"tforkParentClone,omitempty"`
+	TforkInitPIDStartTime     uint64 `json:"tforkInitPIDStartTime,omitempty"`
 	TforkDumpdHolderPid       int    `json:"tforkDumpdHolderPid,omitempty"`
 	TforkDumpdHolderStartTime uint64 `json:"tforkDumpdHolderStartTime,omitempty"`
 }

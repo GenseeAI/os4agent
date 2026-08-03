@@ -828,6 +828,30 @@ func (r *ConmonOCIRuntime) CheckpointContainer(ctr *Container, options Container
 
 func (r *ConmonOCIRuntime) CheckConmonRunning(ctr *Container) (bool, error) {
 	if ctr.state.ConmonPID == 0 {
+		// Direct tfork clones deliberately use a lightweight exit watcher
+		// instead of conmon.  Their init PID, not a missing conmon PID, is the
+		// authoritative liveness signal.
+		if ctr.config.ExternalSetup && ctr.state.PID > 0 {
+			if expected := ctr.config.TforkInitPIDStartTime; expected != 0 {
+				current, err := ReadProcStartTime(ctr.state.PID)
+				if errors.Is(err, os.ErrNotExist) || errors.Is(err, unix.ESRCH) {
+					return false, nil
+				}
+				if err != nil {
+					return false, fmt.Errorf("reading external clone pid %d start time: %w", ctr.state.PID, err)
+				}
+				if current != expected {
+					return false, nil
+				}
+			}
+			if err := unix.Kill(ctr.state.PID, 0); err != nil {
+				if errors.Is(err, unix.ESRCH) {
+					return false, nil
+				}
+				return false, fmt.Errorf("pinging external clone pid %d: %w", ctr.state.PID, err)
+			}
+			return true, nil
+		}
 		// If the container is running or paused, assume Conmon is
 		// running. We didn't record Conmon PID on some old versions, so
 		// that is likely what's going on...
