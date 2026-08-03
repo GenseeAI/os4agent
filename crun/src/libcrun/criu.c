@@ -63,6 +63,29 @@ static const char *console_socket = NULL;
 static int tfork_pre_restore_fd = -1;
 static int tfork_source_detached_fd = -1;
 
+static int
+tfork_criu_log_level (void)
+{
+  const char *override = getenv ("CRIU_TFORK_LOG_LEVEL");
+
+  /* Keep an explicit override for controlled A/B tests and emergency
+     diagnostics.  CRIU accepts levels from unconditional messages (0)
+     through debug (4). */
+  if (override != NULL && override[0] >= '0' && override[0] <= '4' && override[1] == '\0')
+    return override[0] - '0';
+
+  switch (libcrun_get_verbosity ())
+    {
+    case LIBCRUN_VERBOSITY_DEBUG:
+      return CRIU_LOG_DEBUG;
+    case LIBCRUN_VERBOSITY_WARNING:
+      return CRIU_LOG_WARN;
+    case LIBCRUN_VERBOSITY_ERROR:
+    default:
+      return CRIU_LOG_ERROR;
+    }
+}
+
 #  define LIBCRIU_MIN_VERSION 31500
 
 struct libcriu_wrapper_s
@@ -1605,7 +1628,11 @@ libcrun_container_tfork_linux_criu (libcrun_container_t *container, libcrun_chec
       cr_options->work_path = cr_options->image_path;
     }
 
-  libcriu_wrapper->criu_set_log_level (4);
+  /* Tfork used to force CRIU debug logging even for a normal crun request.
+     That makes log formatting and I/O grow with every task and VMA.  Match
+     the runtime's requested verbosity; the explicit override above retains
+     full tracing for Podman's custom tfork path when needed. */
+  libcriu_wrapper->criu_set_log_level (tfork_criu_log_level ());
   libcriu_wrapper->criu_set_log_file (CRIU_TFORK_LOG_FILE);
 
   if (cr_options->tfork_ghost_limit > 0)
