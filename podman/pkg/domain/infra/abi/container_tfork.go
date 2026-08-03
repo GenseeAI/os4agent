@@ -928,6 +928,7 @@ func (ic *ContainerEngine) containerCloneLive(ctx context.Context, opts entities
 		return nil, fmt.Errorf("source %q: could not read libpod config", src.ID())
 	}
 	visibleCloneIDs := make([]string, 0, requestedCopies)
+	visibleClones := make([]entities.TforkCloneMetadata, 0, requestedCopies)
 	for i, cloneID := range cloneIDs {
 		clonePID, err := readTforkClonePID(cloneID, imgDir, i, copies, useNcopyRestore)
 		if err != nil {
@@ -1013,13 +1014,22 @@ func (ic *ContainerEngine) containerCloneLive(ctx context.Context, opts entities
 		}
 		logrus.Infof("tfork: clone %s (%s) registered in libpod state, pid=%d", cloneID, cloneNames[i], clonePID)
 		visibleCloneIDs = append(visibleCloneIDs, cloneID)
+		visibleClones = append(visibleClones, entities.TforkCloneMetadata{
+			ID:     cloneID,
+			Name:   cloneNames[i],
+			PID:    clonePID,
+			Rootfs: cloneRootfsList[i],
+		})
 	}
 
 	if err := tforkInjectFault("before_commit"); err != nil {
 		return nil, err
 	}
 	txn.commit()
-	return &entities.ContainerCreateReport{Id: strings.Join(visibleCloneIDs, "\n")}, nil
+	return &entities.ContainerCreateReport{
+		Id:          strings.Join(visibleCloneIDs, "\n"),
+		TforkClones: visibleClones,
+	}, nil
 }
 
 type tforkCgroupFreezer struct {

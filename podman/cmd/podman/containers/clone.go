@@ -1,7 +1,9 @@
 package containers
 
 import (
+	jsonencoding "encoding/json"
 	"fmt"
+	"os"
 
 	"github.com/containers/podman/v5/cmd/podman/common"
 	"github.com/containers/podman/v5/cmd/podman/registry"
@@ -58,6 +60,9 @@ func cloneFlags(cmd *cobra.Command) {
 
 	tforkOverlayBtrfsFlagName := "tfork-overlay-btrfs"
 	flags.BoolVar(&ctrClone.TforkOverlayBtrfs, tforkOverlayBtrfsFlagName, false, "use overlay-on-btrfs for per-clone rootfs (default: per-clone btrfs subvolume snapshot; overlay shares lower's page cache across siblings; requires --live)")
+
+	tforkMetadataFlagName := "tfork-metadata"
+	flags.BoolVar(&ctrClone.TforkMetadata, tforkMetadataFlagName, false, "print live-clone identity, PID, and rootfs metadata as JSON (only with --live)")
 
 	tforkGhostLimitFlagName := "tfork-ghost-limit"
 	flags.UintVar(&ctrClone.TforkGhostLimit, tforkGhostLimitFlagName, 256<<20, "raise CRIU's ghost-file size cap (bytes); GUI apps need >1MiB default (only with --live)")
@@ -143,6 +148,9 @@ func clone(cmd *cobra.Command, args []string) error {
 		if ctrClone.TforkOverlayBtrfs {
 			return fmt.Errorf("--tfork-overlay-btrfs requires --live: %w", define.ErrInvalidArg)
 		}
+		if ctrClone.TforkMetadata {
+			return fmt.Errorf("--tfork-metadata requires --live: %w", define.ErrInvalidArg)
+		}
 	}
 
 	ctrClone.ID = args[0]
@@ -150,6 +158,9 @@ func clone(cmd *cobra.Command, args []string) error {
 	rep, err := registry.ContainerEngine().ContainerClone(registry.Context(), ctrClone)
 	if err != nil {
 		return err
+	}
+	if ctrClone.TforkMetadata {
+		return jsonencoding.NewEncoder(os.Stdout).Encode(rep.TforkClones)
 	}
 	fmt.Println(rep.Id)
 	return nil
