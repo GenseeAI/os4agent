@@ -130,6 +130,14 @@ func (ic *ContainerEngine) containerCloneLive(ctx context.Context, opts entities
 	if err != nil {
 		return nil, err
 	}
+	sourceFileInjections, err := tforkParseSourceFileInjections(opts.TforkInjectSourceFiles)
+	if err != nil {
+		return nil, err
+	}
+	preparedSourceFileInjections, err := tforkPrepareFileInjections(sourceFileInjections)
+	if err != nil {
+		return nil, fmt.Errorf("prepare source file injection: %w", err)
+	}
 	useSingleCopyConmon := requestedCopies == 1 && os.Getenv("PODMAN_TFORK_SINGLE_COPY_CONMON") == "1"
 	// PODMAN_TFORK_SINGLE_COPY_DIRECT is a debugging escape hatch that skips
 	// the n-copy restore helper for single-copy experiments. Production paths
@@ -162,6 +170,15 @@ func (ic *ContainerEngine) containerCloneLive(ctx context.Context, opts entities
 	defer func() {
 		if retErr != nil {
 			txn.rollback(retErr)
+		}
+	}()
+	// A completed source rotation is the irreversible commit point for that
+	// side effect. Clone rollback still removes unpublished children, but must
+	// not overwrite a credential the live source may have observed after thaw.
+	sourceInjectionCommitted := false
+	defer func() {
+		if retErr != nil && sourceInjectionCommitted {
+			retErr = fmt.Errorf("%w; source file rotation was committed and was not rolled back", retErr)
 		}
 	}()
 
@@ -810,12 +827,16 @@ func (ic *ContainerEngine) containerCloneLive(ctx context.Context, opts entities
 						return nil, fmt.Errorf("wait for tfork source-detached event: %w; see %s", detachErr, logPath)
 					}
 					sourceDetached = true
-					if err := txn.restoreSourceOnce(); err != nil {
-						tforkAbortCrunCmd(crunCmd, src, bundleDir, copies)
-						crunAborted = true
-						return nil, fmt.Errorf("early thaw at tfork source-detached event: %w", err)
+					if len(preparedSourceFileInjections) == 0 {
+						if err := txn.restoreSourceOnce(); err != nil {
+							tforkAbortCrunCmd(crunCmd, src, bundleDir, copies)
+							crunAborted = true
+							return nil, fmt.Errorf("early thaw at tfork source-detached event: %w", err)
+						}
+						logrus.Infof("tfork: source thawed at CRIU source-detached event")
+					} else {
+						logrus.Infof("tfork: source detached; deferring thaw until post-restore source file rotation")
 					}
-					logrus.Infof("tfork: source thawed at CRIU source-detached event")
 				case crunErr = <-crunDone:
 					crunExited = true
 					if crunErr != nil {
@@ -912,6 +933,18 @@ func (ic *ContainerEngine) containerCloneLive(ctx context.Context, opts entities
 	}
 	if err := tforkInjectFault("after_restore"); err != nil {
 		return nil, err
+	}
+	if len(preparedSourceFileInjections) > 0 {
+		srcPID, err := src.PID()
+		if err != nil {
+			return nil, fmt.Errorf("read frozen source PID for file rotation: %w", err)
+		}
+		if err := tforkInstallPreparedFileInjections(srcPID, preparedSourceFileInjections, nil); err != nil {
+			return nil, fmt.Errorf("rotate files in frozen source: %w", err)
+		}
+		sourceInjectionCommitted = true
+		logrus.Infof("tfork: committed %d source file rotation(s); later clone rollback will retain them",
+			len(preparedSourceFileInjections))
 	}
 
 	if err := txn.restoreSourceOnce(); err != nil {
@@ -1048,6 +1081,24 @@ type tforkFileInjection struct {
 	destination string
 }
 
+const tforkMaximumInjectionSize = 1 << 20
+
+type tforkPreparedFileInjection struct {
+	source      string
+	destination string
+	payload     []byte
+}
+
+type tforkStagedFileInjection struct {
+	parent               *os.File
+	destination          string
+	temporary            string
+	backup               string
+	existed              bool
+	originalMoved        bool
+	replacementInstalled bool
+}
+
 func tforkParseFileInjections(specs []string, copies int) (map[int][]tforkFileInjection, error) {
 	parsed := make(map[int][]tforkFileInjection)
 	for _, spec := range specs {
@@ -1075,11 +1126,262 @@ func tforkParseFileInjections(specs []string, copies int) (map[int][]tforkFileIn
 	return parsed, nil
 }
 
+func tforkParseSourceFileInjections(specs []string) ([]tforkFileInjection, error) {
+	parsed := make([]tforkFileInjection, 0, len(specs))
+	seenDestinations := make(map[string]struct{}, len(specs))
+	for _, spec := range specs {
+		parts := strings.SplitN(spec, ":", 2)
+		if len(parts) != 2 {
+			return nil, fmt.Errorf("invalid --tfork-inject-source-file %q (expected HOST_PATH:CONTAINER_PATH)", spec)
+		}
+		source := filepath.Clean(parts[0])
+		destination := filepath.Clean(parts[1])
+		if !filepath.IsAbs(source) || source == string(os.PathSeparator) {
+			return nil, fmt.Errorf("tfork source injection source must be a non-root absolute path: %q", parts[0])
+		}
+		if !filepath.IsAbs(destination) || destination == string(os.PathSeparator) {
+			return nil, fmt.Errorf("tfork source injection destination must be a non-root absolute path: %q", parts[1])
+		}
+		if _, exists := seenDestinations[destination]; exists {
+			return nil, fmt.Errorf("duplicate tfork source injection destination %q", destination)
+		}
+		seenDestinations[destination] = struct{}{}
+		parsed = append(parsed, tforkFileInjection{source: source, destination: destination})
+	}
+	return parsed, nil
+}
+
+func tforkReadInjectionSource(path string) ([]byte, error) {
+	sourceFD, err := unix.Open(path, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	if err != nil {
+		return nil, fmt.Errorf("open source %s: %w", path, err)
+	}
+	source := os.NewFile(uintptr(sourceFD), path)
+	defer source.Close()
+	info, err := source.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("stat source %s: %w", path, err)
+	}
+	if !info.Mode().IsRegular() || info.Size() > tforkMaximumInjectionSize {
+		return nil, fmt.Errorf("source must be a regular file no larger than %d bytes", tforkMaximumInjectionSize)
+	}
+	payload, err := io.ReadAll(io.LimitReader(source, tforkMaximumInjectionSize+1))
+	if err != nil {
+		return nil, fmt.Errorf("read source %s: %w", path, err)
+	}
+	if len(payload) > tforkMaximumInjectionSize {
+		return nil, fmt.Errorf("source grew beyond %d bytes while being read", tforkMaximumInjectionSize)
+	}
+	return payload, nil
+}
+
+func tforkPrepareFileInjections(injections []tforkFileInjection) ([]tforkPreparedFileInjection, error) {
+	prepared := make([]tforkPreparedFileInjection, 0, len(injections))
+	for _, injection := range injections {
+		payload, err := tforkReadInjectionSource(injection.source)
+		if err != nil {
+			return nil, err
+		}
+		prepared = append(prepared, tforkPreparedFileInjection{
+			source:      injection.source,
+			destination: injection.destination,
+			payload:     payload,
+		})
+	}
+	return prepared, nil
+}
+
+func tforkInjectionTemporaryNames(parentFD int) (string, string, error) {
+	for attempt := 0; attempt < 16; attempt++ {
+		id := stringid.GenerateRandomID()
+		if len(id) > 16 {
+			id = id[:16]
+		}
+		temporary := ".tfork-inject-new-" + id
+		backup := ".tfork-inject-old-" + id
+		var stat unix.Stat_t
+		if err := unix.Fstatat(parentFD, temporary, &stat, unix.AT_SYMLINK_NOFOLLOW); !errors.Is(err, unix.ENOENT) {
+			if err != nil {
+				return "", "", fmt.Errorf("check temporary injection path: %w", err)
+			}
+			continue
+		}
+		if err := unix.Fstatat(parentFD, backup, &stat, unix.AT_SYMLINK_NOFOLLOW); !errors.Is(err, unix.ENOENT) {
+			if err != nil {
+				return "", "", fmt.Errorf("check backup injection path: %w", err)
+			}
+			continue
+		}
+		return temporary, backup, nil
+	}
+	return "", "", fmt.Errorf("cannot allocate unique source injection paths")
+}
+
+func tforkStagePreparedFileInjection(root string, injection tforkPreparedFileInjection) (*tforkStagedFileInjection, error) {
+	parent, err := pathrs.OpenInRoot(root, filepath.Dir(injection.destination))
+	if err != nil {
+		return nil, fmt.Errorf("open destination parent for %s: %w", injection.destination, err)
+	}
+	parentFD := int(parent.Fd())
+	stage := &tforkStagedFileInjection{
+		parent:      parent,
+		destination: filepath.Base(injection.destination),
+	}
+	var existing unix.Stat_t
+	err = unix.Fstatat(parentFD, stage.destination, &existing, unix.AT_SYMLINK_NOFOLLOW)
+	if err == nil {
+		if existing.Mode&unix.S_IFMT != unix.S_IFREG {
+			parent.Close()
+			return nil, fmt.Errorf("destination %s exists and is not a regular file", injection.destination)
+		}
+		stage.existed = true
+	} else if !errors.Is(err, unix.ENOENT) {
+		parent.Close()
+		return nil, fmt.Errorf("stat destination %s: %w", injection.destination, err)
+	}
+
+	stage.temporary, stage.backup, err = tforkInjectionTemporaryNames(parentFD)
+	if err != nil {
+		parent.Close()
+		return nil, err
+	}
+	temporaryFD, err := unix.Openat(parentFD, stage.temporary,
+		unix.O_WRONLY|unix.O_CREAT|unix.O_EXCL|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0o600)
+	if err != nil {
+		parent.Close()
+		return nil, fmt.Errorf("create temporary injection file for %s: %w", injection.destination, err)
+	}
+	temporary := os.NewFile(uintptr(temporaryFD), stage.temporary)
+	failed := true
+	defer func() {
+		if failed {
+			temporary.Close()
+			_ = unix.Unlinkat(parentFD, stage.temporary, 0)
+			parent.Close()
+		}
+	}()
+	if n, err := temporary.Write(injection.payload); err != nil {
+		return nil, fmt.Errorf("write temporary injection file for %s: %w", injection.destination, err)
+	} else if n != len(injection.payload) {
+		return nil, fmt.Errorf("write temporary injection file for %s: %w", injection.destination, io.ErrShortWrite)
+	}
+	if stage.existed {
+		var temporaryStat unix.Stat_t
+		if err := unix.Fstat(temporaryFD, &temporaryStat); err != nil {
+			return nil, fmt.Errorf("stat temporary injection file for %s: %w", injection.destination, err)
+		}
+		if temporaryStat.Uid != existing.Uid || temporaryStat.Gid != existing.Gid {
+			if err := unix.Fchown(temporaryFD, int(existing.Uid), int(existing.Gid)); err != nil {
+				return nil, fmt.Errorf("preserve ownership for %s: %w", injection.destination, err)
+			}
+		}
+	}
+	if err := unix.Fchmod(temporaryFD, 0o600); err != nil {
+		return nil, fmt.Errorf("chmod temporary injection file for %s: %w", injection.destination, err)
+	}
+	if err := temporary.Close(); err != nil {
+		return nil, fmt.Errorf("close temporary injection file for %s: %w", injection.destination, err)
+	}
+	failed = false
+	return stage, nil
+}
+
+func tforkCloseStagedFileInjections(staged []*tforkStagedFileInjection) {
+	for _, stage := range staged {
+		if stage.parent != nil {
+			stage.parent.Close()
+			stage.parent = nil
+		}
+	}
+}
+
+func tforkRemoveStagedTemporaryFiles(staged []*tforkStagedFileInjection) {
+	for _, stage := range staged {
+		if stage.parent != nil && stage.temporary != "" {
+			_ = unix.Unlinkat(int(stage.parent.Fd()), stage.temporary, 0)
+		}
+	}
+}
+
+func tforkRollbackInstalledFileInjections(staged []*tforkStagedFileInjection) error {
+	var rollbackErrors []error
+	for i := len(staged) - 1; i >= 0; i-- {
+		stage := staged[i]
+		parentFD := int(stage.parent.Fd())
+		if stage.originalMoved {
+			if err := unix.Renameat(parentFD, stage.backup, parentFD, stage.destination); err != nil {
+				rollbackErrors = append(rollbackErrors,
+					fmt.Errorf("restore original %s: %w", stage.destination, err))
+			} else {
+				stage.originalMoved = false
+				stage.replacementInstalled = false
+			}
+		} else if stage.replacementInstalled {
+			if err := unix.Unlinkat(parentFD, stage.destination, 0); err != nil && !errors.Is(err, unix.ENOENT) {
+				rollbackErrors = append(rollbackErrors,
+					fmt.Errorf("remove new destination %s: %w", stage.destination, err))
+			} else {
+				stage.replacementInstalled = false
+			}
+		}
+	}
+	return errors.Join(rollbackErrors...)
+}
+
+func tforkInstallPreparedFileInjections(pid int, injections []tforkPreparedFileInjection, afterCommit func(int) error) error {
+	root := filepath.Join("/proc", strconv.Itoa(pid), "root")
+	staged := make([]*tforkStagedFileInjection, 0, len(injections))
+	for _, injection := range injections {
+		stage, err := tforkStagePreparedFileInjection(root, injection)
+		if err != nil {
+			tforkRemoveStagedTemporaryFiles(staged)
+			tforkCloseStagedFileInjections(staged)
+			return err
+		}
+		staged = append(staged, stage)
+	}
+	defer tforkCloseStagedFileInjections(staged)
+
+	for i, stage := range staged {
+		parentFD := int(stage.parent.Fd())
+		if stage.existed {
+			if err := unix.Renameat(parentFD, stage.destination, parentFD, stage.backup); err != nil {
+				rollbackErr := tforkRollbackInstalledFileInjections(staged)
+				tforkRemoveStagedTemporaryFiles(staged)
+				return errors.Join(fmt.Errorf("backup destination %s: %w", stage.destination, err), rollbackErr)
+			}
+			stage.originalMoved = true
+		}
+		if err := unix.Renameat(parentFD, stage.temporary, parentFD, stage.destination); err != nil {
+			rollbackErr := tforkRollbackInstalledFileInjections(staged)
+			tforkRemoveStagedTemporaryFiles(staged)
+			return errors.Join(fmt.Errorf("install destination %s: %w", stage.destination, err), rollbackErr)
+		}
+		stage.replacementInstalled = true
+		if afterCommit != nil {
+			if err := afterCommit(i); err != nil {
+				rollbackErr := tforkRollbackInstalledFileInjections(staged)
+				tforkRemoveStagedTemporaryFiles(staged)
+				return errors.Join(err, rollbackErr)
+			}
+		}
+	}
+
+	for _, stage := range staged {
+		if stage.originalMoved {
+			if err := unix.Unlinkat(int(stage.parent.Fd()), stage.backup, 0); err != nil {
+				logrus.Warnf("tfork: remove committed source injection backup %s: %v", stage.backup, err)
+			}
+			stage.originalMoved = false
+		}
+	}
+	return nil
+}
+
 // New destination files inherit Podman's filesystem UID/GID, while an existing
 // destination retains its ownership. All destinations are forced to mode 0600;
 // this interface intentionally does not provide ownership or mode overrides.
 func tforkInjectFileIntoProcessRoot(pid int, injection tforkFileInjection) error {
-	const maximumInjectionSize = 1 << 20
 	sourceFD, err := unix.Open(injection.source, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
 	if err != nil {
 		return fmt.Errorf("open source %s: %w", injection.source, err)
@@ -1090,8 +1392,8 @@ func tforkInjectFileIntoProcessRoot(pid int, injection tforkFileInjection) error
 	if err != nil {
 		return fmt.Errorf("stat source %s: %w", injection.source, err)
 	}
-	if !info.Mode().IsRegular() || info.Size() > maximumInjectionSize {
-		return fmt.Errorf("source must be a regular file no larger than %d bytes", maximumInjectionSize)
+	if !info.Mode().IsRegular() || info.Size() > tforkMaximumInjectionSize {
+		return fmt.Errorf("source must be a regular file no larger than %d bytes", tforkMaximumInjectionSize)
 	}
 
 	root := filepath.Join("/proc", strconv.Itoa(pid), "root")
