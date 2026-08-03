@@ -1817,5 +1817,8 @@ func (s *APIServer) registerContainersHandlers(r *mux.Router) error {
 	//   500:
 	//     $ref: "#/responses/internalError"
 	r.HandleFunc(VersionedPath("/libpod/containers/{name}/update"), s.APIHandler(libpod.UpdateContainer)).Methods(http.MethodPost)
+	// Experimental root-owned local live-clone endpoint. The handler rejects
+	// TCP listeners and remains disabled unless PODMAN_TFORK_LOCAL_API=1.
+	r.HandleFunc(VersionedPath("/libpod/containers/{name}/tfork"), s.APIHandler(libpod.TforkCloneLocal)).Methods(http.MethodPost)
 	return nil
 }
