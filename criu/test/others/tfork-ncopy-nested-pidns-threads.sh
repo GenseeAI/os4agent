@@ -69,6 +69,7 @@ print(f"nested-init nspid={nspid} threads={threads}")
 cleanup
 test -f "$workload"
 podman_cmd run -d --name "$source_name" \
+	--log-driver k8s-file \
 	--cap-add SYS_ADMIN \
 	--security-opt seccomp=unconfined \
 	--security-opt apparmor=unconfined \
