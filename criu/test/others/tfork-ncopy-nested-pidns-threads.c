@@ -22,6 +22,20 @@ static void set_name(const char *name)
 	}
 }
 
+static void unblock_signals(void)
+{
+	sigset_t mask;
+	int ret;
+
+	sigemptyset(&mask);
+	ret = pthread_sigmask(SIG_SETMASK, &mask, NULL);
+	if (ret) {
+		errno = ret;
+		perror("pthread_sigmask");
+		exit(1);
+	}
+}
+
 static void park(void)
 {
 	for (;;)
@@ -121,6 +135,8 @@ int main(int argc, char **argv)
 	if (siblings < 1 || threads < 1)
 		return 2;
 
+	/* CRIU's parasite bootstrap must be able to deliver its SIGTRAP. */
+	unblock_signals();
 	set_name("tfork-test-root");
 	spawn_siblings(siblings);
 	helper = fork();
