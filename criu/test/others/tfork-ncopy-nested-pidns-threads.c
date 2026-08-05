@@ -62,9 +62,9 @@ static void spawn_siblings(int count)
 			exit(1);
 		}
 		if (pid == 0) {
-			execlp("sleep", "sleep", "3600", NULL);
-			perror("exec sleep sibling");
-			_exit(1);
+			set_name("tfork-sibling");
+			park();
+			_exit(0);
 		}
 	}
 }
@@ -149,7 +149,6 @@ int main(int argc, char **argv)
 
 	while (access(READY_PATH, F_OK))
 		usleep(10000);
-	execlp("tail", "tail", "-f", "/dev/null", NULL);
-	perror("exec tail root");
-	return 1;
+	park();
+	return 0;
 }
