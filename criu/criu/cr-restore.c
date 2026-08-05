@@ -1677,6 +1677,7 @@ static inline int fork_with_pid_mode(struct pstree_item *item, bool parallel_sib
 	}
 
 	if (item == root_item) {
+		/* Non-root tasks publish their real PID from __restore_task_with_children(). */
 		item->pid->real = ret;
 		pr_debug("PID: real %d virt %d\n", item->pid->real, localpid(item));
 	}
