@@ -28,8 +28,7 @@ def spawn_siblings(count):
 	for _ in range(count):
 		pid = os.fork()
 		if pid == 0:
-			set_name("tfork-sibling")
-			park()
+			os.execl("/bin/sleep", "tfork-sibling", "3600")
 			os._exit(0)
 
 
