@@ -581,7 +581,29 @@ self:
 	return 0;
 }
 
-static int __collect_child_pids(struct pstree_item *p, int state, unsigned int *n)
+/*
+ * The pid of `pi` as seen by `p`.  ns[0] is innermost, so stepping in
+ * (child depth - p's depth) entries gives p's view.  localpid() only
+ * matches when both live in the same namespace: a nested pidns init is 1
+ * to itself and something else entirely to its parent.
+ */
+static pid_t pid_in_parent_ns(struct pstree_item *p, struct pstree_item *pi)
+{
+	int idx = pi->pid->ns_level - p->pid->ns_level;
+
+	if (idx <= 0 || idx >= pi->pid->ns_level)
+		return localpid(pi);
+
+	return pi->pid->ns[idx].ns_pid;
+}
+
+/*
+ * `observer` is whoever waits on these children, which is not always p:
+ * children of helpers and zombies are reparented to init.  Pids are
+ * recorded in the observer's namespace.
+ */
+static int __collect_child_pids(struct pstree_item *p, struct pstree_item *observer, int state,
+				unsigned int *n)
 {
 	struct pstree_item *pi;
 
@@ -596,7 +618,15 @@ static int __collect_child_pids(struct pstree_item *p, int state, unsigned int *
 			return -1;
 
 		(*n)++;
-		*child = localpid(pi);
+		/*
+		 * Zombies only.  A helper's pid chain is synthesised by
+		 * get_or_create_helper_item(), so translating it through ns[]
+		 * would yield a pid that was never real.
+		 */
+		if (state == TASK_DEAD)
+			*child = pid_in_parent_ns(observer, pi);
+		else
+			*child = localpid(pi);
 	}
 
 	return 0;
@@ -617,12 +647,12 @@ static int collect_child_pids(int state, unsigned int *n)
 		for_each_pstree_item(pi) {
 			if (pi->pid->state != TASK_HELPER && pi->pid->state != TASK_DEAD)
 				continue;
-			if (__collect_child_pids(pi, state, n))
+			if (__collect_child_pids(pi, current, state, n))
 				return -1;
 		}
 	}
 
-	return __collect_child_pids(current, state, n);
+	return __collect_child_pids(current, current, state, n);
 }
 
 static int collect_helper_pids(struct task_restore_args *ta)
@@ -1546,11 +1576,18 @@ static inline int fork_with_pid_mode(struct pstree_item *item, bool parallel_sib
 
 	ca.item = item;
 	ca.clone_flags = rsti(item)->clone_flags;
-	if (opts.tfork.active && item != root_item &&
+	/*
+	 * Innermost pid 1 below the restore root means a nested pidns init,
+	 * which needs CLONE_NEWPID.  A zombie has no ids image, so
+	 * get_clone_mask() cannot derive the flag and clone3() would apply
+	 * the set_tid chain against the parent's namespace and hit EEXIST.
+	 * Not tfork-specific: plain dump/restore breaks the same way.
+	 */
+	if (item != root_item &&
 	    !(ca.clone_flags & CLONE_NEWPID) &&
 	    item->pid->ns_level > 1 &&
 	    item->pid->ns[0].ns_pid == INIT_PID) {
-		pr_info("tfork: repairing missing CLONE_NEWPID for pidns init uid=%d local=%d parent_local=%d level=%d\n",
+		pr_info("repairing missing CLONE_NEWPID for pidns init uid=%d local=%d parent_local=%d level=%d\n",
 			uid(item), pid,
 			item->parent ? localpid(item->parent) : -1,
 			item->pid->ns_level);
