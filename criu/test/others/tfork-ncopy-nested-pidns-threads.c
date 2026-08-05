@@ -48,7 +48,7 @@ static void spawn_siblings(int count)
 			exit(1);
 		}
 		if (pid == 0) {
-			execlp("sleep", "tfork-sibling", "3600", NULL);
+			execlp("sleep", "sleep", "3600", NULL);
 			perror("exec sleep sibling");
 			_exit(1);
 		}
