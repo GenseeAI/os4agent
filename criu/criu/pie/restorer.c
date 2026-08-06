@@ -2485,18 +2485,6 @@ tfork_skip_page_restore:
 				c_args.set_tid = ptr_to_u64(thread_args[i].tid_in_ns);
 				c_args.flags = clone_flags;
 				c_args.set_tid_size = thread_args[i].ns_level;
-				if (args->tfork_active && thread_args[i].ns_level > 0) {
-					/*
-					 * Preserve the TID visible in the clone's innermost PID namespace.
-					 * Outer namespace TIDs are allocated by the kernel so concurrent
-					 * copy helpers cannot collide with each other on the host.
-					 */
-					pr_debug("tfork: restore thread pid=%d with innermost tid=%d, set_tid_size %d -> 1\n",
-						thread_args[i].pid,
-						thread_args[i].tid_in_ns[0],
-						thread_args[i].ns_level);
-					c_args.set_tid_size = 1;
-				}
 				/* The kernel does stack + stack_size. */
 				c_args.stack = new_sp - RESTORE_STACK_SIZE;
 				c_args.stack_size = RESTORE_STACK_SIZE;
